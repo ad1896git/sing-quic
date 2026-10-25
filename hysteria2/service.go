@@ -172,12 +172,15 @@ func (s *Service[U]) handleConnection(connection quic.Connection) {
 
 type serverSession[U comparable] struct {
 	*Service[U]
-	ctx           context.Context
-	quicConn      quic.Connection
-	source        M.Socksaddr
-	connAccess    sync.Mutex
-	connDone      chan struct{}
-	connErr       error
+	ctx        context.Context
+	quicConn   quic.Connection
+	source     M.Socksaddr
+	connAccess sync.Mutex
+	connDone   chan struct{}
+	connErr    error
+	// authAccess guards publication and all HTTP/TCP reads of authentication.
+	// authUser is immutable after publication, before the UDP loop starts.
+	authAccess    sync.Mutex
 	authenticated bool
 	authUser      U
 	udpAccess     sync.RWMutex
@@ -186,7 +189,9 @@ type serverSession[U comparable] struct {
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
+		s.authAccess.Lock()
 		if s.authenticated {
+			s.authAccess.Unlock()
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !s.udpDisabled,
 				Rx:         s.receiveBPS,
@@ -198,11 +203,14 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		request := protocol.AuthRequestFromHeader(r.Header)
 		user, loaded := s.userMap[request.Auth]
 		if !loaded {
+			s.authAccess.Unlock()
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
 		s.authUser = user
 		s.authenticated = true
+		s.authAccess.Unlock()
+		// Only the handler that published authentication performs session setup.
 		if !s.ignoreClientBandwidth && request.Rx > 0 {
 			rx := request.Rx
 			if s.sendBPS > 0 && rx > s.sendBPS {
@@ -244,7 +252,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *serverSession[U]) handleStream0(frameType http3.FrameType, id quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
-	if !s.authenticated || err != nil {
+	s.authAccess.Lock()
+	authenticated := s.authenticated
+	s.authAccess.Unlock()
+	if !authenticated || err != nil {
 		return false, nil
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
@@ -268,7 +279,10 @@ func (s *serverSession[U]) handleStream(stream quic.Stream) error {
 	if err != nil {
 		return E.New("read TCP request")
 	}
-	ctx := auth.ContextWithUser(s.ctx, s.authUser)
+	s.authAccess.Lock()
+	user := s.authUser
+	s.authAccess.Unlock()
+	ctx := auth.ContextWithUser(s.ctx, user)
 	_ = s.handler.NewConnection(ctx, &serverConn{Stream: stream}, M.Metadata{
 		Source:      s.source,
 		Destination: M.ParseSocksaddr(destinationString),
