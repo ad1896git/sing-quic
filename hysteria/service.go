@@ -25,6 +25,8 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
+const defaultMaxIncomingStreams = 100
+
 type ServiceOptions struct {
 	Context       context.Context
 	Logger        logger.Logger
@@ -70,7 +72,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	quicConfig := &quic.Config{
 		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:                !options.UDPDisabled,
-		MaxIncomingStreams:             1 << 60,
+		MaxIncomingStreams:             defaultMaxIncomingStreams,
 		InitialStreamReceiveWindow:     DefaultStreamReceiveWindow,
 		MaxStreamReceiveWindow:         DefaultStreamReceiveWindow,
 		InitialConnectionReceiveWindow: DefaultConnReceiveWindow,
