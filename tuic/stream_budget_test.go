@@ -32,13 +32,13 @@ func TestIncomingStreamBudgetConstructors(t *testing.T) {
 		"service unidirectional": service.quicConfig.MaxIncomingUniStreams,
 		"client unidirectional":  client.quicConfig.MaxIncomingUniStreams,
 	} {
-		if got != 100 {
-			t.Errorf("%s = %d, want 100", name, got)
+		if got != defaultMaxIncomingStreams {
+			t.Errorf("%s = %d, want %d", name, got, defaultMaxIncomingStreams)
 		}
 	}
 }
 
-// Exercise the actual constructor configs over an in-memory packet link. Only 100 streams and
+// Exercise the actual constructor configs over an in-memory packet link. Only defaultMaxIncomingStreams streams and
 // one replacement are ever opened; no high-numbered stream frames are used.
 func TestIncomingStreamBudgetTransport(t *testing.T) {
 	service, err := NewService[string](ServiceOptions{})
@@ -95,7 +95,7 @@ func TestIncomingStreamBudgetTransport(t *testing.T) {
 
 			var firstSend quic.SendStream
 			var firstReceive quic.ReceiveStream
-			for i := 0; i < 100; i++ {
+			for i := 0; i < defaultMaxIncomingStreams; i++ {
 				var send quic.SendStream
 				if tc.uni {
 					send, err = sender.OpenUniStream()
@@ -139,7 +139,7 @@ func TestIncomingStreamBudgetTransport(t *testing.T) {
 			}
 			var limitErr *quic.StreamLimitReachedError
 			if !errors.As(err, &limitErr) {
-				t.Fatalf("open stream 101 = %v, want StreamLimitReachedError", err)
+				t.Fatalf("open stream %d = %v, want StreamLimitReachedError", defaultMaxIncomingStreams+1, err)
 			}
 
 			// FIN must be consumed, and both directions of a bidirectional stream

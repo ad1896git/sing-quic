@@ -25,7 +25,7 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
-const defaultMaxIncomingStreams = 100
+const defaultMaxIncomingStreams = 1024
 
 type ServiceOptions struct {
 	Context       context.Context

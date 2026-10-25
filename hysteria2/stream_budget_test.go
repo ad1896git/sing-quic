@@ -15,7 +15,7 @@ func TestIncomingStreamBudgetConstructor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := service.quicConfig.MaxIncomingStreams; got != 100 {
-		t.Fatalf("MaxIncomingStreams = %d, want 100", got)
+	if got := service.quicConfig.MaxIncomingStreams; got != defaultMaxIncomingStreams {
+		t.Fatalf("MaxIncomingStreams = %d, want %d", got, defaultMaxIncomingStreams)
 	}
 }

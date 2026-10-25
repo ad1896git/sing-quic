@@ -27,7 +27,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
-const defaultMaxIncomingStreams = 100
+const defaultMaxIncomingStreams = 1024
 
 type ServiceOptions struct {
 	Context           context.Context
