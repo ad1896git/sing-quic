@@ -128,26 +128,38 @@ func ReadTCPResponse(r io.Reader) (ok bool, message string, err error) {
 	return
 }
 
-func WriteTCPResponse(ok bool, msg string, payload []byte) *buf.Buffer {
-	padding := tcpResponsePadding.String()
+var generateTCPResponsePadding = tcpResponsePadding.String
+
+func WriteTCPResponse(ok bool, msg string, payload []byte) (*buf.Buffer, error) {
+	padding := generateTCPResponsePadding()
 	paddingLen := len(padding)
-	msgLen := len(msg)
-	if msgLen > MaxMessageLength {
-		msgLen = MaxMessageLength
+	if len(msg) > MaxMessageLength {
+		msg = msg[:MaxMessageLength]
 	}
+	msgLen := len(msg)
 	sz := 1 + int(quicvarint.Len(uint64(msgLen))) + msgLen +
 		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
 	buffer := buf.NewSize(sz + len(payload))
+	content := buffer.Extend(sz)
 	if ok {
-		buffer.WriteByte(0)
+		content[0] = 0
 	} else {
-		buffer.WriteByte(1)
+		content[0] = 1
 	}
-	WriteVString(buffer, msg)
-	WriteUVariant(buffer, uint64(paddingLen))
-	buffer.Extend(paddingLen)
-	buffer.Write(payload)
-	return buffer
+	i := 1 + varintPut(content[1:], uint64(msgLen))
+	i += copy(content[i:], msg)
+	i += varintPut(content[i:], uint64(paddingLen))
+	copy(content[i:], padding)
+	n, err := buffer.Write(payload)
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	if n != len(payload) {
+		buffer.Release()
+		return nil, io.ErrShortWrite
+	}
+	return buffer, nil
 }
 
 // UDPMessage format:
@@ -215,6 +227,9 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 		return nil, E.New("invalid address length")
 	}
 	bs := buf.Bytes()
+	if lAddr > uint64(len(bs)) {
+		return nil, io.ErrUnexpectedEOF
+	}
 	m.Addr = string(bs[:lAddr])
 	m.Data = bs[lAddr:]
 	return m, nil

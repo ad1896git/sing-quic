@@ -304,7 +304,10 @@ func (c *serverConn) HandshakeFailure(err error) error {
 		return os.ErrClosed
 	}
 	c.responseWritten = true
-	buffer := protocol.WriteTCPResponse(false, err.Error(), nil)
+	buffer, writeErr := protocol.WriteTCPResponse(false, err.Error(), nil)
+	if writeErr != nil {
+		return writeErr
+	}
 	defer buffer.Release()
 	return common.Error(c.Stream.Write(buffer.Bytes()))
 }
@@ -314,7 +317,10 @@ func (c *serverConn) HandshakeSuccess() error {
 		return nil
 	}
 	c.responseWritten = true
-	buffer := protocol.WriteTCPResponse(true, "", nil)
+	buffer, err := protocol.WriteTCPResponse(true, "", nil)
+	if err != nil {
+		return err
+	}
 	defer buffer.Release()
 	return common.Error(c.Stream.Write(buffer.Bytes()))
 }
@@ -327,7 +333,10 @@ func (c *serverConn) Read(p []byte) (n int, err error) {
 func (c *serverConn) Write(p []byte) (n int, err error) {
 	if !c.responseWritten {
 		c.responseWritten = true
-		buffer := protocol.WriteTCPResponse(true, "", p)
+		buffer, err := protocol.WriteTCPResponse(true, "", p)
+		if err != nil {
+			return 0, baderror.WrapQUIC(err)
+		}
 		defer buffer.Release()
 		_, err = c.Stream.Write(buffer.Bytes())
 		if err != nil {
