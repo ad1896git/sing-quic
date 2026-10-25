@@ -367,7 +367,7 @@ func newUDPDefragger() *udpDefragger {
 			cache.WithAge[uint16, *packetItem](10),
 			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
 			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
-				releaseMessages(value.messages)
+				value.releaseMessages()
 			}),
 		),
 	}
@@ -379,24 +379,36 @@ type packetItem struct {
 	count    uint8
 }
 
+func (p *packetItem) releaseMessages() {
+	for _, message := range p.messages {
+		if message != nil {
+			message.releaseMessage()
+		}
+	}
+	p.messages = nil
+	p.count = 0
+}
+
 func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	if m.fragmentTotal <= 1 {
 		return m
 	}
 	if m.fragmentID >= m.fragmentTotal {
+		m.releaseMessage()
 		return nil
 	}
 	item, _ := d.packetMap.LoadOrStore(m.packetID, newPacketItem)
 	item.access.Lock()
 	defer item.access.Unlock()
 	if int(m.fragmentTotal) != len(item.messages) {
-		releaseMessages(item.messages)
+		item.releaseMessages()
 		item.messages = make([]*udpMessage, m.fragmentTotal)
 		item.count = 1
 		item.messages[m.fragmentID] = m
 		return nil
 	}
 	if item.messages[m.fragmentID] != nil {
+		m.releaseMessage()
 		return nil
 	}
 	item.messages[m.fragmentID] = m
@@ -404,28 +416,29 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	if int(item.count) != len(item.messages) {
 		return nil
 	}
+	// The cache owns every fragment, including m, until reassembly finishes.
+	defer item.releaseMessages()
+	var dataLength int
+	for _, message := range item.messages {
+		dataLength += message.data.Len()
+		if dataLength > math.MaxUint16 {
+			return nil
+		}
+	}
+	if dataLength == 0 {
+		return nil
+	}
 	newMessage := allocMessage()
 	*newMessage = *item.messages[0]
-	var dataLength uint16
+	newMessage.data = buf.NewSize(dataLength)
 	for _, message := range item.messages {
-		dataLength += uint16(message.data.Len())
-	}
-	if dataLength > 0 {
-		newMessage.data = buf.NewSize(int(dataLength))
-		for _, message := range item.messages {
-			common.Must1(newMessage.data.Write(message.data.Bytes()))
-			message.releaseMessage()
-		}
-		item.messages = nil
-		return newMessage
-	} else {
-		newMessage.releaseMessage()
-		for _, message := range item.messages {
-			message.releaseMessage()
+		n, err := newMessage.data.Write(message.data.Bytes())
+		if err != nil || n != message.data.Len() {
+			newMessage.releaseMessage()
+			return nil
 		}
 	}
-	item.messages = nil
-	return nil
+	return newMessage
 }
 
 func newPacketItem() *packetItem {
