@@ -53,19 +53,24 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
 }
 
 func (s *serverSession[U]) handleUDPMessage(message *udpMessage, udpStream bool) {
-	s.udpAccess.RLock()
-	udpConn, loaded := s.udpConnMap[message.sessionID]
-	s.udpAccess.RUnlock()
-	if !loaded || common.Done(udpConn.ctx) {
+	sessionID := message.sessionID
+	s.udpAccess.Lock()
+	udpConn, loaded := s.udpConnMap[sessionID]
+	created := !loaded || common.Done(udpConn.ctx)
+	if created {
+		// This constructor only allocates state; it cannot invoke onDestroy.
 		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, udpStream, true, func() {
 			s.udpAccess.Lock()
-			delete(s.udpConnMap, message.sessionID)
+			if s.udpConnMap[sessionID] == udpConn {
+				delete(s.udpConnMap, sessionID)
+			}
 			s.udpAccess.Unlock()
 		})
-		udpConn.sessionID = message.sessionID
-		s.udpAccess.Lock()
-		s.udpConnMap[message.sessionID] = udpConn
-		s.udpAccess.Unlock()
+		udpConn.sessionID = sessionID
+		s.udpConnMap[sessionID] = udpConn
+	}
+	s.udpAccess.Unlock()
+	if created {
 		newCtx, newConn := canceler.NewPacketConn(udpConn.ctx, udpConn, s.udpTimeout)
 		go s.handler.NewPacketConnection(newCtx, newConn, M.Metadata{
 			Source:      s.source,

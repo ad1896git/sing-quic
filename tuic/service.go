@@ -304,14 +304,14 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		if err != nil {
 			return err
 		}
-		s.udpAccess.RLock()
+		s.udpAccess.Lock()
 		udpConn, loaded := s.udpConnMap[sessionID]
-		s.udpAccess.RUnlock()
+		if loaded {
+			delete(s.udpConnMap, sessionID)
+		}
+		s.udpAccess.Unlock()
 		if loaded {
 			udpConn.closeWithError(E.New("remote closed"))
-			s.udpAccess.Lock()
-			delete(s.udpConnMap, sessionID)
-			s.udpAccess.Unlock()
 		}
 		return nil
 	default:
