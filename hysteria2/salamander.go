@@ -47,7 +47,7 @@ func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 	if n <= salamanderSaltLen {
 		return
 	}
-	key := blake2b.Sum256(append(s.password, p[:salamanderSaltLen]...))
+	key := salamanderKey(s.password, p[:salamanderSaltLen])
 	for index, c := range p[salamanderSaltLen:n] {
 		p[index] = c ^ key[index%blake2b.Size256]
 	}
@@ -58,7 +58,7 @@ func (s *SalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	buffer := buf.NewSize(len(p) + salamanderSaltLen)
 	defer buffer.Release()
 	buffer.WriteRandom(salamanderSaltLen)
-	key := blake2b.Sum256(append(s.password, buffer.Bytes()...))
+	key := salamanderKey(s.password, buffer.Bytes())
 	for index, c := range p {
 		common.Must(buffer.WriteByte(c ^ key[index%blake2b.Size256]))
 	}
@@ -77,7 +77,7 @@ type VectorisedSalamanderPacketConn struct {
 func (s *VectorisedSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	buffer := buf.NewSize(salamanderSaltLen)
 	buffer.WriteRandom(salamanderSaltLen)
-	key := blake2b.Sum256(append(s.password, buffer.Bytes()...))
+	key := salamanderKey(s.password, buffer.Bytes())
 	for i := range p {
 		p[i] ^= key[i%blake2b.Size256]
 	}
@@ -92,14 +92,21 @@ func (s *VectorisedSalamanderPacketConn) WriteVectorisedPacket(buffers []*buf.Bu
 	header := buf.NewSize(salamanderSaltLen)
 	defer header.Release()
 	header.WriteRandom(salamanderSaltLen)
-	key := blake2b.Sum256(append(s.password, header.Bytes()...))
+	key := salamanderKey(s.password, header.Bytes())
 	var bufferIndex int
 	for _, buffer := range buffers {
 		content := buffer.Bytes()
 		for index, c := range content {
-			content[bufferIndex+index] = c ^ key[bufferIndex+index%blake2b.Size256]
+			content[index] = c ^ key[(bufferIndex+index)%blake2b.Size256]
 		}
 		bufferIndex += len(content)
 	}
 	return s.writer.WriteVectorisedPacket(append([]*buf.Buffer{header}, buffers...), destination)
+}
+
+func salamanderKey(secret, salt []byte) [blake2b.Size256]byte {
+	input := make([]byte, len(secret)+len(salt))
+	copy(input, secret)
+	copy(input[len(secret):], salt)
+	return blake2b.Sum256(input)
 }
