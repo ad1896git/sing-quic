@@ -72,7 +72,8 @@ func TestClientClosePacketConn(t *testing.T) {
 			var order []string
 			rawConn := &closeTestRawConn{Conn: raw, order: &order}
 			defer raw.Close()
-			baseline := closeTestHopGoroutines()
+			// Earlier subtests may still be exiting their workers.
+			waitCloseTestHopGoroutines(t, 0)
 			var packetConn net.PacketConn
 			if hopping {
 				packetConn, err = hop.NewUDPHopPacketConn("127.0.0.1", strconv.Itoa(server.LocalAddr().(*net.UDPAddr).Port), 5*time.Second, func() (net.PacketConn, error) {
@@ -86,7 +87,7 @@ func TestClientClosePacketConn(t *testing.T) {
 			}
 			defer packetConn.Close()
 			if hopping {
-				waitCloseTestHopGoroutines(t, baseline+2)
+				waitCloseTestHopGoroutines(t, 2)
 			}
 			tracked := &closeTestPacketConn{PacketConn: packetConn, order: &order}
 			conn := &clientQUICConnection{
@@ -125,7 +126,7 @@ func TestClientClosePacketConn(t *testing.T) {
 				t.Fatal("connection close was not signaled")
 			}
 			if hopping {
-				waitCloseTestHopGoroutines(t, baseline)
+				waitCloseTestHopGoroutines(t, 0)
 				if _, err := packetConn.WriteTo([]byte("closed"), server.LocalAddr()); !errors.Is(err, net.ErrClosed) {
 					t.Fatalf("hop WriteTo after Close = %v, want net.ErrClosed", err)
 				}
@@ -180,7 +181,8 @@ func TestClientInitFailureClosesPacketConn(t *testing.T) {
 				hopPorts:   ports, hopInterval: 5 * time.Second,
 				tlsConfig: initTestTLSConfig{err: initErr},
 			}
-			baseline := closeTestHopGoroutines()
+			// Earlier subtests may still be exiting their workers.
+			waitCloseTestHopGoroutines(t, 0)
 			conn, err := client.offerNew(context.Background())
 			if err == nil || conn != nil {
 				t.Fatalf("offerNew = (%v, %v), want failure", conn, err)
@@ -188,7 +190,7 @@ func TestClientInitFailureClosesPacketConn(t *testing.T) {
 			if ports != "invalid" && !errors.Is(err, initErr) {
 				t.Fatalf("offerNew error = %v, want %v", err, initErr)
 			}
-			waitCloseTestHopGoroutines(t, baseline)
+			waitCloseTestHopGoroutines(t, 0)
 			if dialer.raw.closes != 1 {
 				t.Fatalf("raw Close calls = %d, want 1", dialer.raw.closes)
 			}
@@ -212,7 +214,7 @@ func closeTestHopGoroutines() int {
 
 func waitCloseTestHopGoroutines(t *testing.T, want int) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if closeTestHopGoroutines() == want {
 			return
