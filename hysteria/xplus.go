@@ -51,7 +51,7 @@ func (c *XPlusPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		n = 0
 		return
 	}
-	key := sha256.Sum256(append(c.key, p[:xplusSaltLen]...))
+	key := xplusKey(c.key, p[:xplusSaltLen])
 	for i := range p[xplusSaltLen:] {
 		p[i] = p[xplusSaltLen+i] ^ key[i%sha256.Size]
 	}
@@ -67,7 +67,7 @@ func (c *XPlusPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	c.randAccess.Lock()
 	_, _ = c.rand.Read(salt)
 	c.randAccess.Unlock()
-	key := sha256.Sum256(append(c.key, salt...))
+	key := xplusKey(c.key, salt)
 	for i := range p {
 		common.Must(buffer.WriteByte(p[i] ^ key[i%sha256.Size]))
 	}
@@ -90,7 +90,7 @@ func (c *VectorisedXPlusConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 	c.randAccess.Lock()
 	_, _ = c.rand.Read(salt)
 	c.randAccess.Unlock()
-	key := sha256.Sum256(append(c.key, salt...))
+	key := xplusKey(c.key, salt)
 	for i := range p {
 		p[i] ^= key[i%sha256.Size]
 	}
@@ -104,7 +104,7 @@ func (c *VectorisedXPlusConn) WriteVectorisedPacket(buffers []*buf.Buffer, desti
 	c.randAccess.Lock()
 	_, _ = c.rand.Read(salt)
 	c.randAccess.Unlock()
-	key := sha256.Sum256(append(c.key, salt...))
+	key := xplusKey(c.key, salt)
 	var index int
 	for _, buffer := range buffers {
 		data := buffer.Bytes()
@@ -115,4 +115,11 @@ func (c *VectorisedXPlusConn) WriteVectorisedPacket(buffers []*buf.Buffer, desti
 	}
 	buffers = append([]*buf.Buffer{header}, buffers...)
 	return c.writer.WriteVectorisedPacket(buffers, destination)
+}
+
+func xplusKey(secret, salt []byte) [sha256.Size]byte {
+	input := make([]byte, len(secret)+len(salt))
+	copy(input, secret)
+	copy(input[len(secret):], salt)
+	return sha256.Sum256(input)
 }
