@@ -14,83 +14,98 @@ on:
       - main
       - dev
 
+env:
+  GOTOOLCHAIN: local
+  GOWORK: off
+  GOFLAGS: -mod=readonly
+
 jobs:
   build:
     name: Linux Debug build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: ^1.22
+          go-version: '1.22.12'
       - name: Build
         run: |
-          make test
+          go test -v -tags=debug,with_low_memory ./...
   build_go120:
     name: Linux Debug build (Go 1.20)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: ~1.20
-        continue-on-error: true
+          go-version: '1.20.14'
       - name: Build
         run: |
-          make test
+          go test -v -tags=debug,with_low_memory ./...
   build_go121:
     name: Linux Debug build (Go 1.21)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: ~1.21
-        continue-on-error: true
+          go-version: '1.21.13'
       - name: Build
         run: |
-          make test
+          go test -v -tags=debug,with_low_memory ./...
   build__windows:
     name: Windows Debug build
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: ^1.22
-        continue-on-error: true
+          go-version: '1.22.12'
       - name: Build
         run: |
-          make test
+          go test -v -tags=debug,with_low_memory ./...
   build_darwin:
     name: macOS Debug build
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: ^1.22
-        continue-on-error: true
+          go-version: '1.22.12'
       - name: Build
         run: |
-          make test
+          go test -v -tags=debug,with_low_memory ./...
+  race:
+    name: Linux Race test
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.22.12'
+      - name: Test with race detector
+        run: go test -race ./...
