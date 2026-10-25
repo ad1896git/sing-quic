@@ -184,10 +184,22 @@ type serverSession[U comparable] struct {
 }
 
 func (s *serverSession[U]) handleConnection() {
-	ctx, cancel := context.WithTimeout(s.ctx, ProtocolTimeout)
+	s.handleConnectionTimeout(ProtocolTimeout)
+}
+
+// The timeout argument lets tests exercise the production handshake with a short budget.
+func (s *serverSession[U]) handleConnectionTimeout(timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(s.ctx, timeout)
+	defer cancel()
+	stop := watchHandshake(ctx, cancel, s.quicConn)
+	defer stop()
 	controlStream, err := s.quicConn.AcceptStream(ctx)
-	cancel()
 	if err != nil {
+		s.closeWithError0(ErrorCodeProtocolError, err)
+		return
+	}
+	deadline, _ := ctx.Deadline()
+	if err = controlStream.SetDeadline(deadline); err != nil {
 		s.closeWithError0(ErrorCodeProtocolError, err)
 		return
 	}
@@ -214,6 +226,16 @@ func (s *serverSession[U]) handleConnection() {
 		s.closeWithError(err)
 		return
 	}
+	stop()
+	if err = ctx.Err(); err != nil {
+		s.closeWithError0(ErrorCodeProtocolError, err)
+		return
+	}
+	if err = controlStream.SetDeadline(time.Time{}); err != nil {
+		s.closeWithError0(ErrorCodeProtocolError, err)
+		return
+	}
+	cancel()
 	s.authUser = user
 	s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(clientHello.RecvBPS))), s.brutalDebug, s.logger))
 	if !s.udpDisabled {
@@ -381,4 +403,26 @@ func (c *serverConn) RemoteAddr() net.Addr {
 func (c *serverConn) Close() error {
 	c.Stream.CancelRead(0)
 	return c.Stream.Close()
+}
+
+// watchHandshake aborts pending I/O on cancellation and stops watching before a
+// successful connection is handed to its long-lived owner.
+func watchHandshake(ctx context.Context, cancel context.CancelFunc, conn quic.Connection) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+			_ = conn.CloseWithError(ErrorCodeProtocolError, "handshake canceled")
+		case <-conn.Context().Done():
+			cancel()
+		case <-stop:
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
+	}
 }
