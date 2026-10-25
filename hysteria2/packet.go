@@ -83,12 +83,21 @@ func (m *udpMessage) headerSize() int {
 	return 8 + int(quicvarint.Len(uint64(len(m.destination)))) + len(m.destination)
 }
 
-func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
+func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, error) {
+	// Check before subtraction so even a negative packet limit cannot overflow.
+	if maxPacketSize <= message.headerSize() {
+		return nil, errors.New("UDP payload MTU must be positive")
+	}
 	udpMTU := maxPacketSize - message.headerSize()
 	if message.data.Len() <= udpMTU {
-		return []*udpMessage{message}
+		return []*udpMessage{message}, nil
 	}
-	var fragments []*udpMessage
+	// Subtract first to avoid overflow when rounding up the fragment count.
+	fragmentTotal := 1 + (message.data.Len()-1)/udpMTU
+	if fragmentTotal > math.MaxUint8 {
+		return nil, errors.New("UDP message requires more than 255 fragments")
+	}
+	fragments := make([]*udpMessage, 0, fragmentTotal)
 	originPacket := message.data.Bytes()
 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
 		fragment := allocMessage()
@@ -102,7 +111,6 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
 		}
 		fragments = append(fragments, fragment)
 	}
-	fragmentTotal := uint16(len(fragments))
 	for index, fragment := range fragments {
 		fragment.fragmentID = uint8(index)
 		fragment.fragmentTotal = uint8(fragmentTotal)
@@ -111,7 +119,7 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
 			// not work in hysteria
 		}*/
 	}
-	return fragments
+	return fragments, nil
 }
 
 type udpPacketConn struct {
@@ -191,8 +199,8 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	}
 	defer message.releaseMessage()
 	var err error
-	if buffer.Len() > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
+	if c.udpMTU <= message.headerSize() || buffer.Len() > c.udpMTU-message.headerSize() {
+		err = c.writeFragmented(message, c.udpMTU)
 	} else {
 		err = c.writePacket(message)
 	}
@@ -203,7 +211,7 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	if !errors.As(err, &tooLargeErr) {
 		return err
 	}
-	return c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
+	return c.writeFragmented(message, int(tooLargeErr.MaxDatagramPayloadSize)-3)
 }
 
 func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -224,8 +232,8 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		destination:   addr.String(),
 		data:          buf.As(p),
 	}
-	if len(p) > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
+	if c.udpMTU <= message.headerSize() || len(p) > c.udpMTU-message.headerSize() {
+		err = c.writeFragmented(message, c.udpMTU)
 		if err == nil {
 			return len(p), nil
 		}
@@ -239,7 +247,7 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !errors.As(err, &tooLargeErr) {
 		return
 	}
-	err = c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
+	err = c.writeFragmented(message, int(tooLargeErr.MaxDatagramPayloadSize)-3)
 	if err == nil {
 		return len(p), nil
 	}
@@ -261,6 +269,14 @@ func (c *udpPacketConn) inputPacket(message *udpMessage) {
 			}
 		}
 	}
+}
+
+func (c *udpPacketConn) writeFragmented(message *udpMessage, maxPacketSize int) error {
+	fragments, err := fragUDPMessage(message, maxPacketSize)
+	if err != nil {
+		return err
+	}
+	return c.writePackets(fragments)
 }
 
 func (c *udpPacketConn) writePackets(messages []*udpMessage) error {
