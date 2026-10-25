@@ -125,26 +125,33 @@ func NewClient(options ClientOptions) (*Client, error) {
 }
 
 func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
-	c.connAccess.RLock()
-	conn := c.conn
-	active := conn != nil && conn.active()
-	c.connAccess.RUnlock()
-	if active {
-		return conn, nil
+	for {
+		c.connAccess.RLock()
+		conn := c.conn
+		active := conn != nil && conn.active()
+		c.connAccess.RUnlock()
+		if active {
+			return conn, nil
+		}
+		// Finalise the stale connection without extending the publication lock.
+		if conn != nil {
+			conn.closeWithError(context.Cause(conn.quicConn.Context()))
+		}
+		c.connAccess.Lock()
+		if c.conn != conn {
+			c.connAccess.Unlock()
+			continue
+		}
+		newConn, err := c.offerNew(ctx)
+		if err != nil {
+			c.connAccess.Unlock()
+			return nil, err
+		}
+		// Publish only after initialization, while excluding CloseWithError.
+		c.conn = newConn
+		c.connAccess.Unlock()
+		return newConn, nil
 	}
-	c.connAccess.Lock()
-	defer c.connAccess.Unlock()
-	conn = c.conn
-	if conn != nil && conn.active() {
-		return conn, nil
-	}
-	conn, err := c.offerNew(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// Publish only after initialization, while excluding CloseWithError.
-	c.conn = conn
-	return conn, nil
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
@@ -237,6 +244,14 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		go c.loopMessages(conn)
 	}
 	initialized = true
+	go func() {
+		select {
+		case <-quicConn.Context().Done():
+			conn.closeWithError(context.Cause(quicConn.Context()))
+		case <-c.ctx.Done():
+			conn.closeWithError(context.Cause(c.ctx))
+		}
+	}()
 	return conn, nil
 }
 
