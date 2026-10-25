@@ -148,7 +148,18 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
-	udpConn, err := c.dialer.DialContext(c.ctx, "udp", c.serverAddr)
+	ctx, cancel := context.WithTimeout(ctx, ProtocolTimeout)
+	defer cancel()
+	// Client shutdown also cancels setup, without giving the request ownership
+	// of the established connection's lifetime.
+	go func() {
+		select {
+		case <-c.ctx.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	udpConn, err := c.dialer.DialContext(ctx, "udp", c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -184,10 +195,12 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if c.xplusPassword != "" {
 		packetConn = NewXPlusPacketConn(packetConn, []byte(c.xplusPassword), c.hopPorts != "")
 	}
-	quicConn, err = qtls.Dial(c.ctx, packetConn, udpConn.RemoteAddr(), c.tlsConfig, c.quicConfig)
+	quicConn, err = qtls.Dial(ctx, packetConn, udpConn.RemoteAddr(), c.tlsConfig, c.quicConfig)
 	if err != nil {
 		return nil, err
 	}
+	stop := watchHandshake(ctx, cancel, quicConn)
+	defer stop()
 	controlStream, err := quicConn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
@@ -206,6 +219,10 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	if !serverHello.OK {
 		return nil, E.New("remote error: ", serverHello.Message)
+	}
+	stop()
+	if err = ctx.Err(); err != nil {
+		return nil, err
 	}
 	quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), c.brutalDebug, c.logger))
 	conn := &clientQUICConnection{
