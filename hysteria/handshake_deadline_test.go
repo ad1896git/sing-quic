@@ -228,7 +228,11 @@ func TestHandshakeDeadlineClientCancellation(t *testing.T) {
 	cancel()
 	handshakeWait(t, first)
 	unlocked := make(chan struct{})
-	go func() { client.connAccess.Lock(); client.connAccess.Unlock(); close(unlocked) }()
+	go func() {
+		client.connAccess.Lock()
+		defer client.connAccess.Unlock()
+		close(unlocked)
+	}()
 	handshakeWait(t, unlocked)
 }
 

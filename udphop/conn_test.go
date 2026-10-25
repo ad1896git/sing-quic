@@ -80,7 +80,10 @@ func TestCloseUnblocksTimeoutWithFullQueue(t *testing.T) {
 		currentConn: socket,
 		recvQueue:   make(chan *udpPacket, 1),
 		closeChan:   make(chan struct{}),
-		bufPool:     sync.Pool{New: func() interface{} { return make([]byte, udpBufferSize) }},
+		bufPool: sync.Pool{New: func() interface{} {
+			buf := make([]byte, udpBufferSize)
+			return &buf
+		}},
 	}
 	pc.recvQueue <- &udpPacket{}
 	reader := &timeoutPacketConn{read: make(chan struct{})}

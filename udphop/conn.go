@@ -42,7 +42,7 @@ type udpHopPacketConn struct {
 }
 
 type udpPacket struct {
-	Buf  []byte
+	Buf  *[]byte
 	N    int
 	Addr net.Addr
 	Err  error
@@ -77,7 +77,8 @@ func NewUDPHopPacketConn(addrStr string, hopPorts string, hopInterval time.Durat
 		closeChan:   make(chan struct{}),
 		bufPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, udpBufferSize)
+				buf := make([]byte, udpBufferSize)
+				return &buf
 			},
 		},
 		listenPacket: listenPacket,
@@ -89,8 +90,8 @@ func NewUDPHopPacketConn(addrStr string, hopPorts string, hopInterval time.Durat
 
 func (u *udpHopPacketConn) recvLoop(conn net.PacketConn) {
 	for {
-		buf := u.bufPool.Get().([]byte)
-		n, addr, err := conn.ReadFrom(buf)
+		buf := u.bufPool.Get().(*[]byte)
+		n, addr, err := conn.ReadFrom(*buf)
 		if err != nil {
 			u.bufPool.Put(buf)
 			var netErr net.Error
@@ -173,7 +174,7 @@ func (u *udpHopPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) 
 			}
 			// Currently we do not check whether the packet is from
 			// the server or not due to performance reasons.
-			n := copy(b, p.Buf[:p.N])
+			n := copy(b, (*p.Buf)[:p.N])
 			u.bufPool.Put(p.Buf)
 			return n, u.Addr, nil
 		case <-u.closeChan:
