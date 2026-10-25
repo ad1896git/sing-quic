@@ -23,8 +23,10 @@ func snapshotAuthenticate(service *Service[string], id [16]byte, password string
 	request[0], request[1] = Version, CommandAuthenticate
 	copy(request[2:18], id[:])
 	copy(request[18:], token)
-	session := &serverSession[string]{Service: service, ctx: context.Background(),
-		quicConn: &authTestConn{export: snapshotToken}, connDone: make(chan struct{}), authDone: make(chan struct{})}
+	session := &serverSession[string]{
+		Service: service, ctx: context.Background(),
+		quicConn: &authTestConn{export: snapshotToken}, connDone: make(chan struct{}), authDone: make(chan struct{}),
+	}
 	return session.handleUniStream(&authTestStream{Reader: bytes.NewReader(request)})
 }
 
@@ -147,7 +149,8 @@ func TestUserSnapshotInFlight(t *testing.T) {
 	request[0], request[1] = Version, CommandAuthenticate
 	copy(request[2:18], id[:])
 	copy(request[18:], token)
-	session := &serverSession[string]{Service: service, ctx: context.Background(), connDone: make(chan struct{}), authDone: make(chan struct{}),
+	session := &serverSession[string]{
+		Service: service, ctx: context.Background(), connDone: make(chan struct{}), authDone: make(chan struct{}),
 		quicConn: &authTestConn{export: func(label string, password []byte, length int) ([]byte, error) {
 			close(arrived)
 			<-release

@@ -34,6 +34,7 @@ func (c *authTestConn) SetCongestionControl(congestion.CongestionControl) {
 		c.setup()
 	}
 }
+
 func (c *authTestConn) ReceiveDatagram(context.Context) ([]byte, error) {
 	c.receiveCalls <- struct{}{}
 	return nil, context.Canceled

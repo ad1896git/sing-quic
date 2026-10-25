@@ -23,16 +23,18 @@ import (
 
 // Use the TLS adapter seam to exercise real offer/offerNew publication without
 // a network server or timing-dependent handshakes. Unexpected QUIC calls panic.
-type connSyncTLSBase = aTLS.Config
-type connSyncQUICBase = qtls.Config
-type connSyncTLS struct {
-	connSyncTLSBase
-	connSyncQUICBase
-	mu      sync.Mutex
-	conns   []*connSyncQUIC
-	entered chan struct{}
-	release chan struct{}
-}
+type (
+	connSyncTLSBase  = aTLS.Config
+	connSyncQUICBase = qtls.Config
+	connSyncTLS      struct {
+		connSyncTLSBase
+		connSyncQUICBase
+		mu      sync.Mutex
+		conns   []*connSyncQUIC
+		entered chan struct{}
+		release chan struct{}
+	}
+)
 
 func (f *connSyncTLS) makeConn() *connSyncQUIC {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -70,18 +72,22 @@ func (q *connSyncQUIC) SetCongestionControl(congestion.CongestionControl) {}
 func (q *connSyncQUIC) ConnectionState() quic.ConnectionState {
 	return quic.ConnectionState{SupportsDatagrams: true, ExportKeyingMaterial: func(string, []byte, int) ([]byte, error) { return make([]byte, 32), nil }}
 }
+
 func (q *connSyncQUIC) ReceiveDatagram(context.Context) ([]byte, error) {
 	defer close(q.receiverDone)
 	<-q.ctx.Done()
 	return nil, net.ErrClosed
 }
+
 func (q *connSyncQUIC) OpenStream() (quic.Stream, error) {
 	var response []byte
 	return &connSyncStream{Reader: bytes.NewReader(response)}, nil
 }
+
 func (q *connSyncQUIC) OpenStreamSync(context.Context) (quic.Stream, error) {
 	return q.OpenStream()
 }
+
 func (q *connSyncQUIC) OpenUniStream() (quic.SendStream, error) {
 	return &connSyncStream{Reader: bytes.NewReader(nil)}, nil
 }
@@ -105,6 +111,7 @@ type connSyncRaw struct {
 func (r *connSyncRaw) RemoteAddr() net.Addr {
 	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}
 }
+
 func (r *connSyncRaw) Close() error {
 	if r.closes.Add(1) == 1 {
 		close(r.closed)
