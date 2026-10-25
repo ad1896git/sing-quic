@@ -196,19 +196,27 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	var sessionID uint16
-	clientPacketConn := newUDPPacketConn(ctx, conn.quicConn, c.udpStream, false, func() {
-		conn.udpAccess.Lock()
-		delete(conn.udpConnMap, sessionID)
-		conn.udpAccess.Unlock()
-	})
 	conn.udpAccess.Lock()
-	sessionID = conn.udpSessionID
-	conn.udpSessionID++
-	conn.udpConnMap[sessionID] = clientPacketConn
-	conn.udpAccess.Unlock()
-	clientPacketConn.sessionID = sessionID
-	return clientPacketConn, nil
+	defer conn.udpAccess.Unlock()
+	for attempts := 0; attempts < 1<<16; attempts++ {
+		sessionID := conn.udpSessionID
+		conn.udpSessionID++
+		if _, exists := conn.udpConnMap[sessionID]; exists {
+			continue
+		}
+		var clientPacketConn *udpPacketConn
+		clientPacketConn = newUDPPacketConn(ctx, conn.quicConn, c.udpStream, false, func() {
+			conn.udpAccess.Lock()
+			if conn.udpConnMap[sessionID] == clientPacketConn {
+				delete(conn.udpConnMap, sessionID)
+			}
+			conn.udpAccess.Unlock()
+		})
+		clientPacketConn.sessionID = sessionID
+		conn.udpConnMap[sessionID] = clientPacketConn
+		return clientPacketConn, nil
+	}
+	return nil, E.New("UDP session ID space exhausted")
 }
 
 func (c *Client) CloseWithError(err error) error {
