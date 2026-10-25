@@ -58,6 +58,7 @@ func (s *duplicateSessionStream) Close() error {
 	s.closed.Store(true)
 	return nil
 }
+
 func (s *duplicateSessionStream) CancelRead(quic.StreamErrorCode) {
 	s.once.Do(func() { close(s.readDone) })
 }

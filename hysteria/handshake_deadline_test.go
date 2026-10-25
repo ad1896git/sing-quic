@@ -38,9 +38,11 @@ func (s *handshakeStream) Close() error { return s.Conn.Close() }
 func (s *handshakeStream) SetReadDeadline(deadline time.Time) error {
 	return s.Conn.SetReadDeadline(deadline)
 }
+
 func (s *handshakeStream) SetWriteDeadline(deadline time.Time) error {
 	return s.Conn.SetWriteDeadline(deadline)
 }
+
 func (s *handshakeStream) SetDeadline(deadline time.Time) error {
 	s.mu.Lock()
 	s.deadline = deadline
@@ -73,6 +75,7 @@ func (q *handshakeQUIC) CloseWithError(quic.ApplicationErrorCode, string) error 
 	q.peer.Close()
 	return nil
 }
+
 func (q *handshakeQUIC) AcceptStream(ctx context.Context) (quic.Stream, error) {
 	select {
 	case stream := <-q.incoming:
@@ -83,6 +86,7 @@ func (q *handshakeQUIC) AcceptStream(ctx context.Context) (quic.Stream, error) {
 		return nil, net.ErrClosed
 	}
 }
+
 func (q *handshakeQUIC) OpenStreamSync(ctx context.Context) (quic.Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -104,9 +108,13 @@ func handshakeWait(t *testing.T, done <-chan struct{}) {
 func handshakeServer(t *testing.T, timeout time.Duration) (*handshakeQUIC, net.Conn, <-chan struct{}) {
 	t.Helper()
 	q, peer := handshakePair()
-	session := &serverSession[string]{Service: &Service[string]{logger: new(authTestLogger),
-		sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true},
-		ctx: context.Background(), quicConn: q, connDone: make(chan struct{})}
+	session := &serverSession[string]{
+		Service: &Service[string]{
+			logger:  new(authTestLogger),
+			sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true,
+		},
+		ctx: context.Background(), quicConn: q, connDone: make(chan struct{}),
+	}
 	session.UpdateUsers([]string{"user"}, []string{"password"})
 	done := make(chan struct{})
 	go func() { defer close(done); session.handleConnectionTimeout(timeout) }()
@@ -136,8 +144,10 @@ func TestHandshakeDeadlineServerConnectionClose(t *testing.T) {
 func TestHandshakeDeadlineServerAccept(t *testing.T) {
 	q, peer := handshakePair()
 	<-q.incoming // No stream is opened during the handshake.
-	session := &serverSession[string]{Service: &Service[string]{logger: new(authTestLogger)},
-		ctx: context.Background(), quicConn: q, connDone: make(chan struct{})}
+	session := &serverSession[string]{
+		Service: &Service[string]{logger: new(authTestLogger)},
+		ctx:     context.Background(), quicConn: q, connDone: make(chan struct{}),
+	}
 	defer peer.Close()
 	defer q.CloseWithError(0, "")
 	done := make(chan struct{})
@@ -159,8 +169,10 @@ func (f *handshakeClientTLS) Dial(context.Context, net.PacketConn, net.Addr, *qu
 
 func handshakeClient(t *testing.T, serve func(*handshakeQUIC, net.Conn)) *Client {
 	t.Helper()
-	client := &Client{ctx: context.Background(), dialer: new(connSyncDialer),
-		tlsConfig: &handshakeClientTLS{serve: serve}, sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true}
+	client := &Client{
+		ctx: context.Background(), dialer: new(connSyncDialer),
+		tlsConfig: &handshakeClientTLS{serve: serve}, sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true,
+	}
 	t.Cleanup(func() { client.CloseWithError(net.ErrClosed) })
 	return client
 }

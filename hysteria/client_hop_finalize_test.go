@@ -73,9 +73,11 @@ func hopFinalizeClient(t *testing.T, disabled bool) (*Client, *hopFinalizeDialer
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	d := new(hopFinalizeDialer)
-	c := &Client{ctx: ctx, dialer: d, tlsConfig: new(connSyncTLS),
+	c := &Client{
+		ctx: ctx, dialer: d, tlsConfig: new(connSyncTLS),
 		serverAddr: M.ParseSocksaddr("127.0.0.1:443"), hopPorts: "443", hopInterval: 5 * time.Second,
-		sendBPS: 1000000, receiveBPS: 1000000, udpDisabled: disabled}
+		sendBPS: 1000000, receiveBPS: 1000000, udpDisabled: disabled,
+	}
 	t.Cleanup(func() { cancel(); _ = c.CloseWithError(net.ErrClosed) })
 	return c, d, cancel
 }
@@ -190,6 +192,7 @@ func (d *hopFinalizeNetworkDialer) DialContext(ctx context.Context, network stri
 	d.rawConn = &connSyncRaw{Conn: raw, closed: make(chan struct{})}
 	return &hopFinalizeNetworkRaw{connSyncRaw: d.rawConn}, nil
 }
+
 func (d *hopFinalizeNetworkDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -263,10 +266,12 @@ func TestHopFinalizeServerClose(t *testing.T) {
 			defer func() { cancel(); _ = listener.Close(); hopFinalizeWait(t, serverDone) }()
 			d := new(hopFinalizeNetworkDialer)
 			addr := M.ParseSocksaddr(listener.Addr().String())
-			c := &Client{ctx: ctx, dialer: d, serverAddr: addr,
+			c := &Client{
+				ctx: ctx, dialer: d, serverAddr: addr,
 				tlsConfig:  hopFinalizeNetworkTLS{config: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{DefaultALPN}}},
 				quicConfig: &quic.Config{EnableDatagrams: !disabled}, hopPorts: strconv.Itoa(int(addr.Port)), hopInterval: 5 * time.Second,
-				udpDisabled: disabled, sendBPS: 1000000, receiveBPS: 1000000}
+				udpDisabled: disabled, sendBPS: 1000000, receiveBPS: 1000000,
+			}
 			defer c.CloseWithError(net.ErrClosed)
 			conn, err := c.offer(ctx)
 			if err != nil {

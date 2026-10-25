@@ -1,9 +1,9 @@
-# Formatting remains available through make fmt; existing formatting debt is
-# intentionally outside the required correctness gate.
 linters:
   disable-all: true
   enable:
+    - gofumpt
     - govet
+    - gci
     - staticcheck
     - paralleltest
     - ineffassign
