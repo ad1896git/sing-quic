@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -53,6 +54,11 @@ type ServerHandler interface {
 	N.UDPConnectionHandler
 }
 
+// userSnapshot is immutable after publication.
+type userSnapshot[U comparable] struct {
+	userMap map[string]U
+}
+
 type Service[U comparable] struct {
 	ctx                   context.Context
 	logger                logger.Logger
@@ -63,7 +69,7 @@ type Service[U comparable] struct {
 	salamanderPassword    string
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	userMap               map[string]U
+	users                 atomic.Pointer[userSnapshot[U]]
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -99,7 +105,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		salamanderPassword:    options.SalamanderPassword,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
-		userMap:               make(map[string]U),
 		udpDisabled:           options.UDPDisabled,
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
@@ -107,12 +112,28 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// UpdateUsers publishes a complete user snapshot. Mismatched slice lengths are
+// a no-op and leave the previous snapshot unchanged.
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
-	for i, user := range userList {
-		userMap[passwordList[i]] = user
+	if len(userList) != len(passwordList) {
+		return
 	}
-	s.userMap = userMap
+	snapshot := &userSnapshot[U]{userMap: make(map[string]U, len(userList))}
+	for i, user := range userList {
+		snapshot.userMap[passwordList[i]] = user
+	}
+	s.users.Store(snapshot)
+}
+
+// lookupUser uses one published snapshot for the entire authentication lookup.
+func (s *Service[U]) lookupUser(password string) (U, bool) {
+	snapshot := s.users.Load()
+	if snapshot == nil {
+		var zero U
+		return zero, false
+	}
+	user, loaded := snapshot.userMap[password]
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -201,7 +222,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
+		user, loaded := s.lookupUser(request.Auth)
 		if !loaded {
 			s.authAccess.Unlock()
 			s.masqueradeHandler.ServeHTTP(w, r)

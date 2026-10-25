@@ -46,7 +46,7 @@ func authTestSession(t *testing.T) *serverSession[string] {
 	service := &Service[string]{logger: logger.NOP()}
 	service.UpdateUsers([]string{"first", "second"}, [][16]byte{{1}, {2}}, []string{"password1", "password2"})
 	conn := &authTestConn{export: func(label string, context []byte, length int) ([]byte, error) {
-		if len(label) != 16 || length != 32 || string(context) != service.passwordMap[service.userMap[[16]byte([]byte(label))]] {
+		if len(label) != 16 || length != 32 || string(context) != map[byte]string{1: "password1", 2: "password2"}[label[0]] {
 			t.Error("unexpected TLS exporter inputs")
 		}
 		return bytes.Repeat([]byte{label[0]}, length), nil

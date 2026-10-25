@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -52,6 +53,11 @@ type ServerHandler interface {
 	N.UDPConnectionHandler
 }
 
+// userSnapshot is immutable after publication.
+type userSnapshot[U comparable] struct {
+	userMap map[string]U
+}
+
 type Service[U comparable] struct {
 	ctx           context.Context
 	logger        logger.Logger
@@ -61,7 +67,7 @@ type Service[U comparable] struct {
 	xplusPassword string
 	tlsConfig     aTLS.ServerConfig
 	quicConfig    *quic.Config
-	userMap       map[string]U
+	users         atomic.Pointer[userSnapshot[U]]
 	udpDisabled   bool
 	udpTimeout    time.Duration
 	handler       ServerHandler
@@ -112,19 +118,34 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		xplusPassword: options.XPlusPassword,
 		tlsConfig:     options.TLSConfig,
 		quicConfig:    quicConfig,
-		userMap:       make(map[string]U),
 		handler:       options.Handler,
 		udpDisabled:   options.UDPDisabled,
 		udpTimeout:    options.UDPTimeout,
 	}, nil
 }
 
+// UpdateUsers publishes a complete user snapshot. Mismatched slice lengths are
+// a no-op and leave the previous snapshot unchanged.
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
-	for i, user := range userList {
-		userMap[passwordList[i]] = user
+	if len(userList) != len(passwordList) {
+		return
 	}
-	s.userMap = userMap
+	snapshot := &userSnapshot[U]{userMap: make(map[string]U, len(userList))}
+	for i, user := range userList {
+		snapshot.userMap[passwordList[i]] = user
+	}
+	s.users.Store(snapshot)
+}
+
+// lookupUser uses one published snapshot for the entire authentication lookup.
+func (s *Service[U]) lookupUser(password string) (U, bool) {
+	snapshot := s.users.Load()
+	if snapshot == nil {
+		var zero U
+		return zero, false
+	}
+	user, loaded := snapshot.userMap[password]
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -208,7 +229,7 @@ func (s *serverSession[U]) handleConnectionTimeout(timeout time.Duration) {
 		s.closeWithError0(ErrorCodeProtocolError, E.Cause(err, "read client hello"))
 		return
 	}
-	user, loaded := s.userMap[clientHello.Auth]
+	user, loaded := s.lookupUser(clientHello.Auth)
 	if !loaded {
 		WriteServerHello(controlStream, ServerHello{
 			OK:      false,

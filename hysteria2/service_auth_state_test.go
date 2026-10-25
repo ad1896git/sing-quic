@@ -41,14 +41,15 @@ func (c *authTestConn) ReceiveDatagram(context.Context) ([]byte, error) {
 func (c *authTestConn) CloseWithError(quic.ApplicationErrorCode, string) error { return nil }
 
 func authTestSession(conn *authTestConn) *serverSession[string] {
-	return &serverSession[string]{
+	session := &serverSession[string]{
 		Service: &Service[string]{
-			userMap:           map[string]string{"alice-key": "alice", "bob-key": "bob"},
 			logger:            logger.NOP(),
 			masqueradeHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }),
 		},
 		ctx: context.Background(), quicConn: conn, connDone: make(chan struct{}),
 	}
+	session.UpdateUsers([]string{"alice", "bob"}, []string{"alice-key", "bob-key"})
+	return session
 }
 
 func authTestRequest(key string) *http.Request {

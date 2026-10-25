@@ -98,11 +98,12 @@ func TestAuthFailurePasswords(t *testing.T) {
 			handler := &authTestHandler{called: make(chan string, 1)}
 			session := &serverSession[string]{
 				Service: &Service[string]{
-					logger: log, handler: handler, userMap: map[string]string{password: "test-user"},
+					logger: log, handler: handler,
 					sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true,
 				},
 				ctx: ctx, quicConn: server, connDone: make(chan struct{}),
 			}
+			session.UpdateUsers([]string{"test-user"}, []string{password})
 			finished := make(chan struct{})
 			go func() {
 				defer close(finished)
