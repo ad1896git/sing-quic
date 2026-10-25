@@ -27,6 +27,8 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
+const defaultMaxIncomingStreams = 1024
+
 type ServiceOptions struct {
 	Context           context.Context
 	Logger            logger.Logger
@@ -71,8 +73,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:         true,
 		Allow0RTT:               options.ZeroRTTHandshake,
-		MaxIncomingStreams:      1 << 60,
-		MaxIncomingUniStreams:   1 << 60,
+		MaxIncomingStreams:      defaultMaxIncomingStreams,
+		MaxIncomingUniStreams:   defaultMaxIncomingStreams,
 	}
 	switch options.CongestionControl {
 	case "":

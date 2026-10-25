@@ -57,7 +57,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	quicConfig := &quic.Config{
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:         true,
-		MaxIncomingUniStreams:   1 << 60,
+		MaxIncomingUniStreams:   defaultMaxIncomingStreams,
 	}
 	switch options.CongestionControl {
 	case "":
