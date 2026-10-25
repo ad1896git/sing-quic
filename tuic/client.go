@@ -47,7 +47,7 @@ type Client struct {
 	heartbeat         time.Duration
 
 	connAccess sync.RWMutex
-	conn       *clientQUICConnection
+	conn       *clientQUICConnection // guarded by connAccess
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -82,8 +82,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 }
 
 func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
+	c.connAccess.RLock()
 	conn := c.conn
-	if conn != nil && conn.active() {
+	active := conn != nil && conn.active()
+	c.connAccess.RUnlock()
+	if active {
 		return conn, nil
 	}
 	c.connAccess.Lock()
@@ -96,6 +99,8 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Publish only after initialization, while excluding CloseWithError.
+	c.conn = conn
 	return conn, nil
 }
 
@@ -132,7 +137,6 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	go c.loopMessages(conn)
 	go c.loopHeartbeats(conn)
-	c.conn = conn
 	return conn, nil
 }
 
@@ -208,6 +212,9 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 }
 
 func (c *Client) CloseWithError(err error) error {
+	// Wait for any in-flight creation and close it before allowing reconnect.
+	c.connAccess.Lock()
+	defer c.connAccess.Unlock()
 	conn := c.conn
 	if conn != nil {
 		conn.closeWithError(err)
