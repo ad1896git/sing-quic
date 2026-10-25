@@ -3,6 +3,7 @@ package tuic
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -181,10 +182,13 @@ type serverSession[U comparable] struct {
 	connAccess sync.Mutex
 	connDone   chan struct{}
 	connErr    error
-	authDone   chan struct{}
-	authUser   U
-	udpAccess  sync.RWMutex
-	udpConnMap map[uint16]*udpPacketConn
+	// authAccess serializes identity publication with authentication timeout.
+	authAccess  sync.Mutex
+	authExpired bool
+	authDone    chan struct{}
+	authUser    U
+	udpAccess   sync.RWMutex
+	udpConnMap  map[uint16]*udpPacketConn
 }
 
 func (s *serverSession[U]) handle() {
@@ -256,8 +260,18 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		if err != nil {
 			return E.Cause(err, "authentication: export keying material")
 		}
-		if !bytes.Equal(tuicToken, buffer.Range(2+16, 2+16+32)) {
+		if subtle.ConstantTimeCompare(tuicToken, buffer.Range(2+16, 2+16+32)) != 1 {
 			return E.New("authentication: token mismatch")
+		}
+		s.authAccess.Lock()
+		defer s.authAccess.Unlock()
+		select {
+		case <-s.authDone:
+			return E.New("authentication: multiple authentication requests")
+		default:
+		}
+		if s.authExpired {
+			return E.New("authentication timeout")
 		}
 		s.authUser = user
 		close(s.authDone)
@@ -310,6 +324,15 @@ func (s *serverSession[U]) handleAuthTimeout() {
 	case <-s.connDone:
 	case <-s.authDone:
 	case <-time.After(s.authTimeout):
+		s.authAccess.Lock()
+		select {
+		case <-s.authDone:
+			s.authAccess.Unlock()
+			return
+		default:
+		}
+		s.authExpired = true
+		s.authAccess.Unlock()
 		s.closeWithError(E.New("authentication timeout"))
 	}
 }
