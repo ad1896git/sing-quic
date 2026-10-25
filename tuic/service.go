@@ -10,6 +10,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -47,14 +48,19 @@ type ServiceHandler interface {
 	N.UDPConnectionHandler
 }
 
+// userSnapshot is immutable after publication.
+type userSnapshot[U comparable] struct {
+	userMap     map[[16]byte]U
+	passwordMap map[U]string
+}
+
 type Service[U comparable] struct {
 	ctx               context.Context
 	logger            logger.Logger
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
-	userMap           map[[16]byte]U
-	passwordMap       map[U]string
+	users             atomic.Pointer[userSnapshot[U]]
 	congestionControl string
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
@@ -90,7 +96,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		tlsConfig:         options.TLSConfig,
 		heartbeat:         options.Heartbeat,
 		quicConfig:        quicConfig,
-		userMap:           make(map[[16]byte]U),
 		congestionControl: options.CongestionControl,
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
@@ -98,15 +103,18 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// UpdateUsers publishes a complete user snapshot. Mismatched slice lengths are
+// a no-op and leave the previous snapshot unchanged.
 func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList []string) {
-	userMap := make(map[[16]byte]U)
-	passwordMap := make(map[U]string)
-	for index := range userList {
-		userMap[uuidList[index]] = userList[index]
-		passwordMap[userList[index]] = passwordList[index]
+	if len(userList) != len(uuidList) || len(userList) != len(passwordList) {
+		return
 	}
-	s.userMap = userMap
-	s.passwordMap = passwordMap
+	snapshot := &userSnapshot[U]{userMap: make(map[[16]byte]U, len(userList)), passwordMap: make(map[U]string, len(userList))}
+	for index, user := range userList {
+		snapshot.userMap[uuidList[index]] = user
+		snapshot.passwordMap[user] = passwordList[index]
+	}
+	s.users.Store(snapshot)
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -251,12 +259,20 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		}
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
-		user, loaded := s.userMap[userUUID]
+		snapshot := s.users.Load()
+		if snapshot == nil {
+			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
+		}
+		user, loaded := snapshot.userMap[userUUID]
 		if !loaded {
 			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
 		}
+		password, loaded := snapshot.passwordMap[user]
+		if !loaded {
+			return E.New("authentication: missing password for user ", uuid.UUID(userUUID))
+		}
 		handshakeState := s.quicConn.ConnectionState()
-		tuicToken, err := handshakeState.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
+		tuicToken, err := handshakeState.ExportKeyingMaterial(string(userUUID[:]), []byte(password), 32)
 		if err != nil {
 			return E.Cause(err, "authentication: export keying material")
 		}

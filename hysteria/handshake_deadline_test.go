@@ -105,8 +105,9 @@ func handshakeServer(t *testing.T, timeout time.Duration) (*handshakeQUIC, net.C
 	t.Helper()
 	q, peer := handshakePair()
 	session := &serverSession[string]{Service: &Service[string]{logger: new(authTestLogger),
-		userMap: map[string]string{"password": "user"}, sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true},
+		sendBPS: MinSpeedBPS, receiveBPS: MinSpeedBPS, udpDisabled: true},
 		ctx: context.Background(), quicConn: q, connDone: make(chan struct{})}
+	session.UpdateUsers([]string{"user"}, []string{"password"})
 	done := make(chan struct{})
 	go func() { defer close(done); session.handleConnectionTimeout(timeout) }()
 	t.Cleanup(func() { q.CloseWithError(0, ""); handshakeWait(t, done) })
