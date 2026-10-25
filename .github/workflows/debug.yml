@@ -76,10 +76,10 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: '1.22.12'
+          go-version: '1.26.9'
       - name: Build
         run: |
-          go test -v -tags=debug,with_low_memory ./...
+          go test -v "-tags=debug,with_low_memory" ./...
   build_darwin:
     name: macOS Debug build
     runs-on: macos-latest
@@ -91,7 +91,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
-          go-version: '1.22.12'
+          go-version: '1.26.9'
       - name: Build
         run: |
           go test -v -tags=debug,with_low_memory ./...
