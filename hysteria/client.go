@@ -290,6 +290,15 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 		stream.Close()
 		return nil, E.New("remote error: ", response.Message)
 	}
+	conn.udpAccess.Lock()
+	if debug.Enabled {
+		if _, connExists := conn.udpConnMap[response.UDPSessionID]; connExists {
+			conn.udpAccess.Unlock()
+			stream.CancelRead(0)
+			stream.Close()
+			return nil, E.New("udp session id duplicated")
+		}
+	}
 	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, func() {
 		stream.CancelRead(0)
 		stream.Close()
@@ -297,13 +306,6 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 		delete(conn.udpConnMap, response.UDPSessionID)
 		conn.udpAccess.Unlock()
 	})
-	conn.udpAccess.Lock()
-	if debug.Enabled {
-		if _, connExists := conn.udpConnMap[response.UDPSessionID]; connExists {
-			stream.Close()
-			return nil, E.New("udp session id duplicated")
-		}
-	}
 	conn.udpConnMap[response.UDPSessionID] = clientPacketConn
 	conn.udpAccess.Unlock()
 	clientPacketConn.sessionID = response.UDPSessionID
