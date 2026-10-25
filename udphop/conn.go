@@ -98,7 +98,10 @@ func (u *udpHopPacketConn) recvLoop(conn net.PacketConn) {
 				// Only pass through timeout errors here, not permanent errors
 				// like connection closed. Connection close is normal as we close
 				// the old connection to exit this loop every time we hop.
-				u.recvQueue <- &udpPacket{nil, 0, nil, netErr}
+				select {
+				case u.recvQueue <- &udpPacket{nil, 0, nil, netErr}:
+				case <-u.closeChan:
+				}
 			}
 			return
 		}

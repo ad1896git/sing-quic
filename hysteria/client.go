@@ -147,7 +147,23 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if err != nil {
 		return nil, err
 	}
+	rawConn := io.Closer(udpConn)
 	var packetConn net.PacketConn
+	var quicConn quic.Connection
+	initialized := false
+	defer func() {
+		if !initialized {
+			if quicConn != nil {
+				_ = quicConn.CloseWithError(0, "")
+			}
+			if packetConn != nil {
+				_ = packetConn.Close()
+			}
+			if rawConn != nil {
+				_ = rawConn.Close()
+			}
+		}
+	}()
 	if c.hopPorts != "" {
 		packetConn, err = hop.NewUDPHopPacketConn(c.serverAddr.AddrString(), c.hopPorts, c.hopInterval, func() (net.PacketConn, error) {
 			return c.dialer.ListenPacket(c.ctx, c.serverAddr)
@@ -157,18 +173,18 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		}
 	} else {
 		packetConn = bufio.NewUnbindPacketConn(udpConn)
+		// The packet connection owns udpConn on the non-hop path.
+		rawConn = nil
 	}
 	if c.xplusPassword != "" {
 		packetConn = NewXPlusPacketConn(packetConn, []byte(c.xplusPassword), c.hopPorts != "")
 	}
-	quicConn, err := qtls.Dial(c.ctx, packetConn, udpConn.RemoteAddr(), c.tlsConfig, c.quicConfig)
+	quicConn, err = qtls.Dial(c.ctx, packetConn, udpConn.RemoteAddr(), c.tlsConfig, c.quicConfig)
 	if err != nil {
-		udpConn.Close()
 		return nil, err
 	}
 	controlStream, err := quicConn.OpenStreamSync(ctx)
 	if err != nil {
-		packetConn.Close()
 		return nil, err
 	}
 	err = WriteClientHello(controlStream, ClientHello{
@@ -177,22 +193,20 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		Auth:    c.password,
 	})
 	if err != nil {
-		packetConn.Close()
 		return nil, err
 	}
 	serverHello, err := ReadServerHello(controlStream)
 	if err != nil {
-		packetConn.Close()
 		return nil, err
 	}
 	if !serverHello.OK {
-		packetConn.Close()
 		return nil, E.New("remote error: ", serverHello.Message)
 	}
 	quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), c.brutalDebug, c.logger))
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
-		rawConn:     udpConn,
+		rawConn:     rawConn,
+		packetConn:  packetConn,
 		connDone:    make(chan struct{}),
 		udpDisabled: !quicConn.ConnectionState().SupportsDatagrams,
 		udpConnMap:  make(map[uint32]*udpPacketConn),
@@ -200,6 +214,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if !c.udpDisabled {
 		go c.loopMessages(conn)
 	}
+	initialized = true
 	c.conn = conn
 	return conn, nil
 }
@@ -295,6 +310,7 @@ func (c *Client) CloseWithError(err error) error {
 type clientQUICConnection struct {
 	quicConn    quic.Connection
 	rawConn     io.Closer
+	packetConn  net.PacketConn
 	closeOnce   sync.Once
 	connDone    chan struct{}
 	connErr     error
@@ -322,7 +338,12 @@ func (c *clientQUICConnection) closeWithError(err error) {
 		c.connErr = err
 		close(c.connDone)
 		_ = c.quicConn.CloseWithError(0, "")
-		_ = c.rawConn.Close()
+		if c.packetConn != nil {
+			_ = c.packetConn.Close()
+		}
+		if c.rawConn != nil {
+			_ = c.rawConn.Close()
+		}
 	})
 }
 

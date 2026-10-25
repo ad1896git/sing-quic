@@ -119,7 +119,23 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if err != nil {
 		return nil, err
 	}
+	rawConn := io.Closer(udpConn)
 	var packetConn net.PacketConn
+	var quicConn quic.EarlyConnection
+	initialized := false
+	defer func() {
+		if !initialized {
+			if quicConn != nil {
+				_ = quicConn.CloseWithError(0, "")
+			}
+			if packetConn != nil {
+				_ = packetConn.Close()
+			}
+			if rawConn != nil {
+				_ = rawConn.Close()
+			}
+		}
+	}()
 	if c.hopPorts != "" {
 		packetConn, err = hop.NewUDPHopPacketConn(c.serverAddr.AddrString(), c.hopPorts, c.hopInterval, func() (net.PacketConn, error) {
 			return c.dialer.ListenPacket(c.ctx, c.serverAddr)
@@ -129,14 +145,14 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		}
 	} else {
 		packetConn = bufio.NewUnbindPacketConn(udpConn)
+		// The packet connection owns udpConn on the non-hop path.
+		rawConn = nil
 	}
 	if c.salamanderPassword != "" {
 		packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword), c.hopPorts != "")
 	}
-	var quicConn quic.EarlyConnection
 	http3Transport, err := qtls.CreateTransport(packetConn, &quicConn, c.serverAddr, c.tlsConfig, c.quicConfig)
 	if err != nil {
-		udpConn.Close()
 		return nil, err
 	}
 	request := &http.Request{
@@ -151,17 +167,9 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	protocol.AuthRequestToHeader(request.Header, protocol.AuthRequest{Auth: c.password, Rx: c.receiveBPS})
 	response, err := http3Transport.RoundTrip(request.WithContext(ctx))
 	if err != nil {
-		if quicConn != nil {
-			quicConn.CloseWithError(0, "")
-		}
-		udpConn.Close()
 		return nil, err
 	}
 	if response.StatusCode != protocol.StatusAuthOK {
-		if quicConn != nil {
-			quicConn.CloseWithError(0, "")
-		}
-		udpConn.Close()
 		return nil, E.New("authentication failed, status code: ", response.StatusCode)
 	}
 	response.Body.Close()
@@ -185,7 +193,8 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
-		rawConn:     udpConn,
+		rawConn:     rawConn,
+		packetConn:  packetConn,
 		connDone:    make(chan struct{}),
 		udpDisabled: !authResponse.UDPEnabled,
 		udpConnMap:  make(map[uint32]*udpPacketConn),
@@ -193,6 +202,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if !c.udpDisabled {
 		go c.loopMessages(conn)
 	}
+	initialized = true
 	c.conn = conn
 	return conn, nil
 }
@@ -249,6 +259,7 @@ func (c *Client) CloseWithError(err error) error {
 type clientQUICConnection struct {
 	quicConn     quic.Connection
 	rawConn      io.Closer
+	packetConn   net.PacketConn
 	closeOnce    sync.Once
 	connDone     chan struct{}
 	connErr      error
@@ -277,7 +288,12 @@ func (c *clientQUICConnection) closeWithError(err error) {
 		c.connErr = err
 		close(c.connDone)
 		_ = c.quicConn.CloseWithError(0, "")
-		_ = c.rawConn.Close()
+		if c.packetConn != nil {
+			_ = c.packetConn.Close()
+		}
+		if c.rawConn != nil {
+			_ = c.rawConn.Close()
+		}
 	})
 }
 
