@@ -192,6 +192,8 @@ func lifecycleTestDissociate(s *serverSession[string], id uint16) error {
 
 func TestUDPSessionLifecycleDissociateTwice(t *testing.T) {
 	s, h := lifecycleTestSession(t)
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
 	s.connDone, s.authDone = make(chan struct{}), make(chan struct{})
 	close(s.authDone)
 	zero := newUDPPacketConn(s.ctx, nil, false, true, func() {}, nil)
@@ -207,6 +209,10 @@ func TestUDPSessionLifecycleDissociateTwice(t *testing.T) {
 	default:
 		t.Fatal("dissociation did not cancel the session")
 	}
+	// Let the dissociation tombstone expire before testing ID reuse.
+	s.udpAccess.Lock()
+	now = now.Add(31 * time.Second)
+	s.udpAccess.Unlock()
 	live, _ := lifecycleTestCreate(t, s, h, 7)
 	// A handler may close long after dissociation removed its table entry.
 	oldConn.Close()
@@ -219,6 +225,8 @@ func TestUDPSessionLifecycleDissociateTwice(t *testing.T) {
 
 func TestUDPSessionLifecycleDissociateReplacement(t *testing.T) {
 	s, h := lifecycleTestSession(t)
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
 	s.connDone, s.authDone = make(chan struct{}), make(chan struct{})
 	close(s.authDone)
 	old, _ := lifecycleTestCreate(t, s, h, 7)
@@ -234,6 +242,10 @@ func TestUDPSessionLifecycleDissociateReplacement(t *testing.T) {
 	<-canceled
 	// The old connection is canceled, but dissociation has not returned.
 	// Its pending removal must not erase a replacement installed now.
+	// Expire the tombstone so replacement is permitted by the reuse policy.
+	s.udpAccess.Lock()
+	now = now.Add(31 * time.Second)
+	s.udpAccess.Unlock()
 	live, _ := lifecycleTestCreate(t, s, h, 7)
 	close(release)
 	if err := <-done; err != nil {
