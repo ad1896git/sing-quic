@@ -29,7 +29,12 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
-const defaultMaxIncomingStreams = 1024
+const (
+	defaultMaxIncomingStreams = 1024
+	tombstoneTTL              = 30 * time.Second
+	maxTombstones             = 256
+	maxUDPSessions            = 4096
+)
 
 type ServiceOptions struct {
 	Context           context.Context
@@ -178,6 +183,7 @@ func (s *Service[U]) handleConnection(connection quic.Connection) {
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+		now:        time.Now,
 
 		defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 	}
@@ -199,6 +205,8 @@ type serverSession[U comparable] struct {
 	authUser    U
 	udpAccess   sync.RWMutex
 	udpConnMap  map[uint16]*udpPacketConn
+	tombstones  []udpTombstone
+	now         func() time.Time
 
 	defragBudget *defragBudget
 }
@@ -328,6 +336,7 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		udpConn, loaded := s.udpConnMap[sessionID]
 		if loaded {
 			delete(s.udpConnMap, sessionID)
+			s.recordTombstone(sessionID)
 		}
 		s.udpAccess.Unlock()
 		if loaded {
