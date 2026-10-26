@@ -333,6 +333,8 @@ func (c *udpPacketConn) WriterMTU() int {
 }
 
 type udpDefragger struct {
+	// access protects all cache operations and receive-side fragment ownership.
+	access    sync.Mutex
 	packetMap *cache.LruCache[uint16, *packetItem]
 }
 
@@ -342,36 +344,51 @@ func newUDPDefragger() *udpDefragger {
 			cache.WithAge[uint16, *packetItem](10),
 			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
 			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
-				releaseMessages(value.messages)
+				// sing v0.4.1 evicts synchronously during cache operations; it has no janitor.
+				// feed holds udpDefragger.access before taking the cache lock.
+				// Do not lock here: the callback already runs under both locks.
+				value.releaseMessages()
 			}),
 		),
 	}
 }
 
 type packetItem struct {
-	access   sync.Mutex
 	messages []*udpMessage
 	count    uint8
 }
 
+// releaseMessages releases owned receive buffers. The defragger mutex must be held.
+func (p *packetItem) releaseMessages() {
+	for _, message := range p.messages {
+		if message != nil {
+			message.releaseMessage()
+		}
+	}
+	p.messages = nil
+	p.count = 0
+}
+
 func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
+	d.access.Lock()
+	defer d.access.Unlock()
 	if m.fragmentTotal <= 1 {
 		return m
 	}
 	if m.fragmentID >= m.fragmentTotal {
+		m.releaseMessage()
 		return nil
 	}
 	item, _ := d.packetMap.LoadOrStore(m.packetID, newPacketItem)
-	item.access.Lock()
-	defer item.access.Unlock()
 	if int(m.fragmentTotal) != len(item.messages) {
-		releaseMessages(item.messages)
+		item.releaseMessages()
 		item.messages = make([]*udpMessage, m.fragmentTotal)
 		item.count = 1
 		item.messages[m.fragmentID] = m
 		return nil
 	}
 	if item.messages[m.fragmentID] != nil {
+		m.releaseMessage()
 		return nil
 	}
 	item.messages[m.fragmentID] = m
@@ -379,6 +396,7 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	if int(item.count) != len(item.messages) {
 		return nil
 	}
+	defer item.releaseMessages()
 	newMessage := allocMessage()
 	newMessage.sessionID = m.sessionID
 	newMessage.packetID = m.packetID
@@ -391,17 +409,10 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		newMessage.data = buf.NewSize(finalLength)
 		for _, message := range item.messages {
 			newMessage.data.Write(message.data.Bytes())
-			message.releaseMessage()
 		}
-		item.messages = nil
 		return newMessage
-	} else {
-		newMessage.releaseMessage()
-		for _, message := range item.messages {
-			message.releaseMessage()
-		}
 	}
-	item.messages = nil
+	newMessage.release()
 	return nil
 }
 

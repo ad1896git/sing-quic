@@ -374,6 +374,8 @@ func (c *udpPacketConn) SetWriteDeadline(t time.Time) error {
 }
 
 type udpDefragger struct {
+	// access protects all cache operations and receive-side fragment ownership.
+	access    sync.Mutex
 	packetMap *cache.LruCache[uint16, *packetItem]
 }
 
@@ -383,6 +385,9 @@ func newUDPDefragger() *udpDefragger {
 			cache.WithAge[uint16, *packetItem](10),
 			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
 			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
+				// sing v0.4.1 evicts synchronously during cache operations; it has no janitor.
+				// feed holds udpDefragger.access before taking the cache lock.
+				// Do not lock here: the callback already runs under both locks.
 				value.releaseMessages()
 			}),
 		),
@@ -390,11 +395,11 @@ func newUDPDefragger() *udpDefragger {
 }
 
 type packetItem struct {
-	access   sync.Mutex
 	messages []*udpMessage
 	count    uint8
 }
 
+// releaseMessages releases owned receive buffers. The defragger mutex must be held.
 func (p *packetItem) releaseMessages() {
 	for _, message := range p.messages {
 		if message != nil {
@@ -406,6 +411,8 @@ func (p *packetItem) releaseMessages() {
 }
 
 func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
+	d.access.Lock()
+	defer d.access.Unlock()
 	if m.fragmentTotal <= 1 {
 		return m
 	}
@@ -414,8 +421,6 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		return nil
 	}
 	item, _ := d.packetMap.LoadOrStore(m.packetID, newPacketItem)
-	item.access.Lock()
-	defer item.access.Unlock()
 	if int(m.fragmentTotal) != len(item.messages) {
 		item.releaseMessages()
 		item.messages = make([]*udpMessage, m.fragmentTotal)
