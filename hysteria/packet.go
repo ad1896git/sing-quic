@@ -87,6 +87,9 @@ func (m *udpMessage) headerSize() int {
 }
 
 func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, error) {
+	if len(message.host) > math.MaxUint16 {
+		return nil, errors.New("UDP host length exceeds 65535 bytes")
+	}
 	// Check before subtraction so even a negative packet limit cannot overflow.
 	if maxPacketSize <= message.headerSize() {
 		return nil, errors.New("UDP payload MTU must be positive")
@@ -105,6 +108,7 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, erro
 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
 		fragment := allocMessage()
 		*fragment = *message
+		fragment.referenced = true
 		if remaining > udpMTU {
 			fragment.data = buf.As(originPacket[:udpMTU])
 			originPacket = originPacket[udpMTU:]
@@ -200,8 +204,9 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 		host:          destination.AddrString(),
 		port:          destination.Port,
 		data:          buffer,
+		referenced:    true,
 	}
-	defer message.releaseMessage()
+	defer message.release()
 	var err error
 	if c.udpMTU <= message.headerSize() || buffer.Len() > c.udpMTU-message.headerSize() {
 		err = c.writeFragmented(message, c.udpMTU)
@@ -215,7 +220,7 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	if !errors.As(err, &tooLargeErr) {
 		return err
 	}
-	return c.writeFragmented(message, int(tooLargeErr.MaxDatagramPayloadSize)-3)
+	return c.retryFragmented(message, tooLargeErr.MaxDatagramPayloadSize)
 }
 
 func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -237,7 +242,9 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		host:          destination.AddrString(),
 		port:          destination.Port,
 		data:          buf.As(p),
+		referenced:    true,
 	}
+	defer message.release()
 	if c.udpMTU <= message.headerSize() || len(p) > c.udpMTU-message.headerSize() {
 		err = c.writeFragmented(message, c.udpMTU)
 		if err == nil {
@@ -253,7 +260,7 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !errors.As(err, &tooLargeErr) {
 		return
 	}
-	err = c.writeFragmented(message, int(tooLargeErr.MaxDatagramPayloadSize)-3)
+	err = c.retryFragmented(message, tooLargeErr.MaxDatagramPayloadSize)
 	if err == nil {
 		return len(p), nil
 	}
@@ -277,10 +284,23 @@ func (c *udpPacketConn) inputPacket(message *udpMessage) {
 	}
 }
 
+func (c *udpPacketConn) retryFragmented(message *udpMessage, maxDatagramPayloadSize int64) error {
+	// Validate before subtraction and conversion to int, including on 32-bit hosts.
+	if maxDatagramPayloadSize <= 3 || maxDatagramPayloadSize-3 <= int64(message.headerSize()) || maxDatagramPayloadSize-3 > int64(math.MaxInt) {
+		return errors.New("UDP payload MTU must be positive")
+	}
+	maxPacketSize := int(maxDatagramPayloadSize - 3)
+	return c.writeFragmented(message, maxPacketSize)
+}
+
 func (c *udpPacketConn) writeFragmented(message *udpMessage, maxPacketSize int) error {
 	fragments, err := fragUDPMessage(message, maxPacketSize)
 	if err != nil {
 		return err
+	}
+	// The caller owns the original message, including across retries.
+	if len(fragments) == 1 && fragments[0] == message {
+		return c.writePacket(message)
 	}
 	return c.writePackets(fragments)
 }
@@ -297,6 +317,9 @@ func (c *udpPacketConn) writePackets(messages []*udpMessage) error {
 }
 
 func (c *udpPacketConn) writePacket(message *udpMessage) error {
+	if len(message.host) > math.MaxUint16 {
+		return errors.New("UDP host length exceeds 65535 bytes")
+	}
 	buffer := message.pack()
 	defer buffer.Release()
 	return c.quicConn.SendDatagram(buffer.Bytes())
