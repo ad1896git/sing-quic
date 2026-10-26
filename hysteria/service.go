@@ -59,19 +59,21 @@ type userSnapshot[U comparable] struct {
 }
 
 type Service[U comparable] struct {
-	ctx           context.Context
-	logger        logger.Logger
-	brutalDebug   bool
-	sendBPS       uint64
-	receiveBPS    uint64
-	xplusPassword string
-	tlsConfig     aTLS.ServerConfig
-	quicConfig    *quic.Config
-	users         atomic.Pointer[userSnapshot[U]]
-	udpDisabled   bool
-	udpTimeout    time.Duration
-	handler       ServerHandler
-	quicListener  io.Closer
+	ctx            context.Context
+	logger         logger.Logger
+	brutalDebug    bool
+	sendBPS        uint64
+	receiveBPS     uint64
+	xplusPassword  string
+	tlsConfig      aTLS.ServerConfig
+	quicConfig     *quic.Config
+	users          atomic.Pointer[userSnapshot[U]]
+	sessionsAccess sync.Mutex
+	sessions       map[*serverSession[U]]struct{}
+	udpDisabled    bool
+	udpTimeout     time.Duration
+	handler        ServerHandler
+	quicListener   io.Closer
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -135,6 +137,7 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 		snapshot.userMap[passwordList[i]] = user
 	}
 	s.users.Store(snapshot)
+	s.revokeSessions()
 }
 
 // lookupUser uses one published snapshot for the entire authentication lookup.
@@ -147,6 +150,70 @@ func (s *Service[U]) lookupUser(password string) (U, bool) {
 	user, loaded := snapshot.userMap[password]
 	return user, loaded
 }
+
+// sessionValid checks the immutable credential captured during authentication.
+func (s *Service[U]) sessionValid(snapshot *userSnapshot[U], session *serverSession[U]) bool {
+	if snapshot == nil {
+		return false
+	}
+	user, loaded := snapshot.userMap[session.password]
+	return loaded && user == session.authUser
+}
+
+func (s *Service[U]) registerSession(session *serverSession[U]) bool {
+	s.sessionsAccess.Lock()
+	select {
+	case <-session.connDone:
+		s.sessionsAccess.Unlock()
+		return false
+	default:
+	}
+	// Recheck under the sweep's lock: authentication may have used an old snapshot.
+	valid := s.sessionValid(s.users.Load(), session)
+	if valid {
+		if s.sessions == nil {
+			s.sessions = make(map[*serverSession[U]]struct{})
+		}
+		s.sessions[session] = struct{}{}
+	}
+	s.sessionsAccess.Unlock()
+	if !valid {
+		session.closeWithError(errUserRevoked)
+	}
+	return valid
+}
+
+func (s *Service[U]) unregisterSession(session *serverSession[U]) {
+	s.sessionsAccess.Lock()
+	delete(s.sessions, session)
+	s.sessionsAccess.Unlock()
+}
+
+func (s *Service[U]) revokeSessions() {
+	s.sessionsAccess.Lock()
+	// A concurrent update may have superseded the snapshot we just published.
+	snapshot := s.users.Load()
+	var revoked []*serverSession[U]
+	for session := range s.sessions {
+		if !s.sessionValid(snapshot, session) {
+			revoked = append(revoked, session)
+		}
+	}
+	s.sessionsAccess.Unlock()
+	for _, session := range revoked {
+		// Claim only sessions still registered, so concurrent sweeps cannot
+		// close the same session twice. QUIC callbacks run without this lock.
+		s.sessionsAccess.Lock()
+		_, registered := s.sessions[session]
+		delete(s.sessions, session)
+		s.sessionsAccess.Unlock()
+		if registered {
+			session.closeWithError(errUserRevoked)
+		}
+	}
+}
+
+var errUserRevoked = errors.New("user revoked")
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
 	if s.xplusPassword != "" {
@@ -201,6 +268,7 @@ type serverSession[U comparable] struct {
 	connDone     chan struct{}
 	connErr      error
 	authUser     U
+	password     string
 	udpAccess    sync.RWMutex
 	udpConnMap   map[uint32]*udpPacketConn
 	udpSessionID uint32
@@ -214,6 +282,7 @@ func (s *serverSession[U]) handleConnection() {
 
 // The timeout argument lets tests exercise the production handshake with a short budget.
 func (s *serverSession[U]) handleConnectionTimeout(timeout time.Duration) {
+	defer s.closeWithError(net.ErrClosed)
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
 	stop := watchHandshake(ctx, cancel, s.quicConn)
@@ -262,6 +331,10 @@ func (s *serverSession[U]) handleConnectionTimeout(timeout time.Duration) {
 	}
 	cancel()
 	s.authUser = user
+	s.password = clientHello.Auth
+	if !s.registerSession(s) {
+		return
+	}
 	s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(clientHello.RecvBPS))), s.brutalDebug, s.logger))
 	if !s.udpDisabled {
 		go s.loopMessages()
@@ -348,14 +421,20 @@ func (s *serverSession[U]) closeWithError(err error) {
 }
 
 func (s *serverSession[U]) closeWithError0(errorCode int, err error) {
+	defer s.unregisterSession(s)
 	s.connAccess.Lock()
-	defer s.connAccess.Unlock()
 	select {
 	case <-s.connDone:
+		s.connAccess.Unlock()
 		return
 	default:
 		s.connErr = err
 		close(s.connDone)
+	}
+	s.connAccess.Unlock()
+	if errors.Is(err, errUserRevoked) {
+		_ = s.quicConn.CloseWithError(1, "user revoked")
+		return
 	}
 	if E.IsClosedOrCanceled(err) {
 		s.logger.Debug(E.Cause(err, "connection failed"))
