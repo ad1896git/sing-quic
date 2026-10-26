@@ -66,6 +66,8 @@ type Service[U comparable] struct {
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
 	users             atomic.Pointer[userSnapshot[U]]
+	sessionsAccess    sync.Mutex
+	sessions          map[*serverSession[U]]struct{}
 	congestionControl string
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
@@ -120,7 +122,73 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
 		snapshot.passwordMap[user] = passwordList[index]
 	}
 	s.users.Store(snapshot)
+	s.revokeSessions()
 }
+
+// sessionValid checks the immutable credential captured during authentication.
+func (s *Service[U]) sessionValid(snapshot *userSnapshot[U], session *serverSession[U]) bool {
+	if snapshot == nil {
+		return false
+	}
+	user, loaded := snapshot.userMap[session.uuid]
+	password, passwordLoaded := snapshot.passwordMap[session.authUser]
+	return loaded && user == session.authUser && passwordLoaded && password == session.password
+}
+
+func (s *Service[U]) registerSession(session *serverSession[U]) bool {
+	s.sessionsAccess.Lock()
+	select {
+	case <-session.connDone:
+		s.sessionsAccess.Unlock()
+		return false
+	default:
+	}
+	// Recheck under the sweep's lock: authentication may have used an old snapshot.
+	valid := s.sessionValid(s.users.Load(), session)
+	if valid {
+		if s.sessions == nil {
+			s.sessions = make(map[*serverSession[U]]struct{})
+		}
+		s.sessions[session] = struct{}{}
+	}
+	s.sessionsAccess.Unlock()
+	if !valid {
+		session.closeWithError(errUserRevoked)
+	}
+	return valid
+}
+
+func (s *Service[U]) unregisterSession(session *serverSession[U]) {
+	s.sessionsAccess.Lock()
+	delete(s.sessions, session)
+	s.sessionsAccess.Unlock()
+}
+
+func (s *Service[U]) revokeSessions() {
+	s.sessionsAccess.Lock()
+	// A concurrent update may have superseded the snapshot we just published.
+	snapshot := s.users.Load()
+	var revoked []*serverSession[U]
+	for session := range s.sessions {
+		if !s.sessionValid(snapshot, session) {
+			revoked = append(revoked, session)
+		}
+	}
+	s.sessionsAccess.Unlock()
+	for _, session := range revoked {
+		// Claim only sessions still registered, so concurrent sweeps cannot
+		// close the same session twice. QUIC callbacks run without this lock.
+		s.sessionsAccess.Lock()
+		_, registered := s.sessions[session]
+		delete(s.sessions, session)
+		s.sessionsAccess.Unlock()
+		if registered {
+			session.closeWithError(errUserRevoked)
+		}
+	}
+}
+
+var errUserRevoked = errors.New("user revoked")
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
 	if !s.quicConfig.Allow0RTT {
@@ -203,6 +271,8 @@ type serverSession[U comparable] struct {
 	authExpired bool
 	authDone    chan struct{}
 	authUser    U
+	password    string
+	uuid        [16]byte
 	udpAccess   sync.RWMutex
 	udpConnMap  map[uint16]*udpPacketConn
 	tombstones  []udpTombstone
@@ -292,17 +362,24 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 			return E.New("authentication: token mismatch")
 		}
 		s.authAccess.Lock()
-		defer s.authAccess.Unlock()
 		select {
 		case <-s.authDone:
+			s.authAccess.Unlock()
 			return E.New("authentication: multiple authentication requests")
 		default:
 		}
 		if s.authExpired {
+			s.authAccess.Unlock()
 			return E.New("authentication timeout")
 		}
 		s.authUser = user
+		s.uuid = userUUID
+		s.password = password
 		close(s.authDone)
+		s.authAccess.Unlock()
+		// Token validation used one snapshot. Registration independently closes
+		// revoked credentials, without changing the token-validation result.
+		s.registerSession(s)
 		return nil
 	case CommandPacket:
 		select {
@@ -370,6 +447,7 @@ func (s *serverSession[U]) loopStreams() {
 	for {
 		stream, err := s.quicConn.AcceptStream(s.ctx)
 		if err != nil {
+			s.closeWithError(err)
 			return
 		}
 		go func() {
@@ -441,14 +519,20 @@ func (s *serverSession[U]) loopHeartbeats() {
 }
 
 func (s *serverSession[U]) closeWithError(err error) {
+	defer s.unregisterSession(s)
 	s.connAccess.Lock()
-	defer s.connAccess.Unlock()
 	select {
 	case <-s.connDone:
+		s.connAccess.Unlock()
 		return
 	default:
 		s.connErr = err
 		close(s.connDone)
+	}
+	s.connAccess.Unlock()
+	if errors.Is(err, errUserRevoked) {
+		_ = s.quicConn.CloseWithError(1, "user revoked")
+		return
 	}
 	if E.IsClosedOrCanceled(err) {
 		s.logger.Debug(E.Cause(err, "connection failed"))
