@@ -239,6 +239,8 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		connDone:    make(chan struct{}),
 		udpDisabled: !quicConn.ConnectionState().SupportsDatagrams,
 		udpConnMap:  make(map[uint32]*udpPacketConn),
+
+		defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 	}
 	if !c.udpDisabled {
 		go c.loopMessages(conn)
@@ -320,7 +322,7 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 		conn.udpAccess.Lock()
 		delete(conn.udpConnMap, response.UDPSessionID)
 		conn.udpAccess.Unlock()
-	})
+	}, conn.defragBudget)
 	conn.udpConnMap[response.UDPSessionID] = clientPacketConn
 	conn.udpAccess.Unlock()
 	clientPacketConn.sessionID = response.UDPSessionID
@@ -358,6 +360,8 @@ type clientQUICConnection struct {
 	udpDisabled bool
 	udpAccess   sync.RWMutex
 	udpConnMap  map[uint32]*udpPacketConn
+
+	defragBudget *defragBudget
 }
 
 func (c *clientQUICConnection) active() bool {

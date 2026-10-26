@@ -125,6 +125,8 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		rawConn:    udpConn,
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+
+		defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 	}
 	go func() {
 		hErr := c.clientHandshake(quicConn)
@@ -211,7 +213,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 				delete(conn.udpConnMap, sessionID)
 			}
 			conn.udpAccess.Unlock()
-		})
+		}, conn.defragBudget)
 		clientPacketConn.sessionID = sessionID
 		conn.udpConnMap[sessionID] = clientPacketConn
 		return clientPacketConn, nil
@@ -239,6 +241,8 @@ type clientQUICConnection struct {
 	udpAccess    sync.RWMutex
 	udpConnMap   map[uint16]*udpPacketConn
 	udpSessionID uint16
+
+	defragBudget *defragBudget
 }
 
 func (c *clientQUICConnection) active() bool {

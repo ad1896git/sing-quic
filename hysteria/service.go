@@ -185,6 +185,8 @@ func (s *Service[U]) loopConnections(listener qtls.Listener) {
 			source:     M.SocksaddrFromNet(connection.RemoteAddr()),
 			connDone:   make(chan struct{}),
 			udpConnMap: make(map[uint32]*udpPacketConn),
+
+			defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 		}
 		go session.handleConnection()
 	}
@@ -202,6 +204,8 @@ type serverSession[U comparable] struct {
 	udpAccess    sync.RWMutex
 	udpConnMap   map[uint32]*udpPacketConn
 	udpSessionID uint32
+
+	defragBudget *defragBudget
 }
 
 func (s *serverSession[U]) handleConnection() {
@@ -307,7 +311,7 @@ func (s *serverSession[U]) handleStream(stream quic.Stream) error {
 			s.udpAccess.Lock()
 			delete(s.udpConnMap, sessionID)
 			s.udpAccess.Unlock()
-		})
+		}, s.defragBudget)
 		s.udpAccess.Lock()
 		s.udpSessionID++
 		sessionID = s.udpSessionID

@@ -33,8 +33,8 @@ func TestDefragLengthBoundaries(t *testing.T) {
 		{"Two40000", 40000, 40000, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			d := newUDPDefragger()
-			defer d.packetMap.Clear()
+			d := newUDPDefragger(nil)
+			defer d.close()
 			firstData := bytes.Repeat([]byte{1}, test.first)
 			secondData := bytes.Repeat([]byte{2}, test.second)
 			first := defragLengthMessage(1, 2, 0, firstData)
@@ -64,8 +64,7 @@ func TestDefragLengthBoundaries(t *testing.T) {
 					t.Errorf("fragment %d buffer was not released", i)
 				}
 			}
-			item, ok := d.packetMap.Load(1)
-			if !ok || len(item.messages) != 0 || item.count != 0 {
+			if len(d.packetMap) != 0 {
 				t.Fatal("completed reassembly retained fragments")
 			}
 		})
@@ -73,8 +72,8 @@ func TestDefragLengthBoundaries(t *testing.T) {
 }
 
 func TestDefragLengthOutOfOrderAndDuplicate(t *testing.T) {
-	d := newUDPDefragger()
-	defer d.packetMap.Clear()
+	d := newUDPDefragger(nil)
+	defer d.close()
 	if got := d.feed(defragLengthMessage(1, 3, 2, []byte("third"))); got != nil {
 		got.releaseMessage()
 		t.Fatal("incomplete packet delivered")
@@ -111,8 +110,8 @@ func TestDefragLengthZeroFragments(t *testing.T) {
 		{"Mixed", []byte("payload")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			d := newUDPDefragger()
-			defer d.packetMap.Clear()
+			d := newUDPDefragger(nil)
+			defer d.close()
 			d.feed(defragLengthMessage(1, 3, 0, nil))
 			d.feed(defragLengthMessage(1, 3, 1, test.data))
 			got := d.feed(defragLengthMessage(1, 3, 2, nil))
@@ -129,7 +128,7 @@ func TestDefragLengthZeroFragments(t *testing.T) {
 		})
 	}
 	message := defragLengthMessage(2, 1, 0, nil)
-	got := newUDPDefragger().feed(message)
+	got := newUDPDefragger(nil).feed(message)
 	if got != message {
 		t.Fatal("unfragmented empty packet should pass through")
 	}
@@ -137,14 +136,14 @@ func TestDefragLengthZeroFragments(t *testing.T) {
 }
 
 func TestDefragLengthSessionAfterRejection(t *testing.T) {
-	conn := newUDPPacketConn(context.Background(), nil, false, true, nil)
-	defer conn.defragger.packetMap.Clear()
+	conn := newUDPPacketConn(context.Background(), nil, false, true, nil, nil)
+	defer conn.defragger.close()
 	conn.inputPacket(defragLengthMessage(1, 2, 0, make([]byte, 40000)))
 	conn.inputPacket(defragLengthMessage(1, 2, 1, make([]byte, 40000)))
 	if len(conn.data) != 0 {
 		t.Fatal("oversized packet delivered")
 	}
-	// Reuse the packet ID to verify the rejected cache entry is reusable too.
+	// Verify that a rejected packet ID can be reused.
 	conn.inputPacket(defragLengthMessage(1, 2, 0, []byte("normal")))
 	conn.inputPacket(defragLengthMessage(1, 2, 1, []byte(" packet")))
 	conn.inputPacket(defragLengthMessage(2, 1, 0, []byte("next")))

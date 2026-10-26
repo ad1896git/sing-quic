@@ -182,6 +182,8 @@ func (s *Service[U]) handleConnection(connection quic.Connection) {
 		source:     M.SocksaddrFromNet(connection.RemoteAddr()),
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint32]*udpPacketConn),
+
+		defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 	}
 	httpServer := http3.Server{
 		Handler:        session,
@@ -206,6 +208,8 @@ type serverSession[U comparable] struct {
 	authUser      U
 	udpAccess     sync.RWMutex
 	udpConnMap    map[uint32]*udpPacketConn
+
+	defragBudget *defragBudget
 }
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
