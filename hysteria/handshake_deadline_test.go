@@ -16,6 +16,9 @@ import (
 
 const handshakeTestBudget = 150 * time.Millisecond
 
+// The publication tests use immediate, in-memory control streams.
+func (s *connSyncStream) SetDeadline(time.Time) error { return nil }
+
 // Use full duplex streams with real blocking I/O and deadlines. The QUIC
 // transport stays active until explicitly closed, independently of stream I/O.
 type handshakeStream struct {
