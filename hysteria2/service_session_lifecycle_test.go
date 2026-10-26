@@ -66,8 +66,8 @@ func lifecycleTestCreate(t *testing.T, s *serverSession[string], h *lifecycleTes
 
 func TestUDPSessionLifecycleFirstPacket(t *testing.T) {
 	s, h := lifecycleTestSession(t)
-	zero := newUDPPacketConn(s.ctx, nil, func() {})
-	other := newUDPPacketConn(s.ctx, nil, func() {})
+	zero := newUDPPacketConn(s.ctx, nil, func() {}, nil)
+	other := newUDPPacketConn(s.ctx, nil, func() {}, nil)
 	s.udpConnMap[0], s.udpConnMap[9] = zero, other
 	_, conn := lifecycleTestCreate(t, s, h, 7)
 	if err := conn.Close(); err != nil {

@@ -27,13 +27,8 @@ func defragOwnershipClear(t *testing.T, d *udpDefragger) {
 	t.Helper()
 	d.access.Lock()
 	defer d.access.Unlock()
-	// Delete by key: this cache version's Clear stops after its first removal.
-	var keys []uint16
-	d.packetMap.Range(func(key uint16, _ *packetItem) {
-		keys = append(keys, key)
-	})
-	for _, key := range keys {
-		d.packetMap.Delete(key)
+	for _, item := range d.packetMap {
+		d.remove(item)
 	}
 }
 
@@ -61,7 +56,7 @@ func defragOwnershipCheck(t *testing.T, m *udpMessage, payload string) {
 
 func TestDefragOwnershipConcurrent(t *testing.T) {
 	const packets, fragments, workers = 256, 4, 8
-	d := newUDPDefragger()
+	d := newUDPDefragger(nil)
 	defer defragOwnershipClear(t, d)
 	var jobs [workers][]*udpMessage
 	var buffers []*buf.Buffer
@@ -109,15 +104,15 @@ func TestDefragOwnershipConcurrent(t *testing.T) {
 	}
 	d.access.Lock()
 	defer d.access.Unlock()
-	d.packetMap.Range(func(key uint16, item *packetItem) {
+	for key, item := range d.packetMap {
 		if item.count != 0 || len(item.messages) != 0 {
 			t.Errorf("packet %d retained completed fragments", key)
 		}
-	})
+	}
 }
 
 func TestDefragOwnershipDuplicateAndInvalid(t *testing.T) {
-	d := newUDPDefragger()
+	d := newUDPDefragger(nil)
 	defer defragOwnershipClear(t, d)
 	first := defragOwnershipMessage(t, 1, 3, 0, "first")
 	firstBuffer := first.data
@@ -136,7 +131,7 @@ func TestDefragOwnershipDuplicateAndInvalid(t *testing.T) {
 			t.Fatal("discarded fragment buffer was not released")
 		}
 		d.access.Lock()
-		item, ok := d.packetMap.Load(1)
+		item, ok := d.packetMap[1]
 		unchanged := ok && item.count == 1 && len(item.messages) == 3 && item.messages[0] == first
 		d.access.Unlock()
 		if !unchanged {
@@ -181,7 +176,7 @@ func TestDefragOwnershipDuplicateAndInvalid(t *testing.T) {
 
 func TestDefragOwnershipEviction(t *testing.T) {
 	const packets, fragments, workers = 128, 4, 8
-	d := newUDPDefragger()
+	d := newUDPDefragger(nil)
 	defer defragOwnershipClear(t, d)
 	var buffers []*buf.Buffer
 	for packet := 0; packet < packets; packet++ {
@@ -189,15 +184,14 @@ func TestDefragOwnershipEviction(t *testing.T) {
 		buffers = append(buffers, m.data)
 		d.feed(m)
 	}
-	// Force the real eviction callback without waiting for expiry.
+	// Force removal without waiting for expiry.
 	defragOwnershipClear(t, d)
 	for i, buffer := range buffers {
 		if buffer.Len() != 0 {
 			t.Fatalf("evicted fragment %d buffer was not released", i)
 		}
 	}
-	// Keep every packet incomplete in the cache before starting the workers,
-	// so Delete invokes the real WithEvict callback even if it runs first.
+	// Keep every packet incomplete before starting the removal workers.
 	for packet := 0; packet < packets; packet++ {
 		m := defragOwnershipMessage(t, uint16(packet), fragments, 0, "x")
 		buffers = append(buffers, m.data)
@@ -232,7 +226,9 @@ func TestDefragOwnershipEviction(t *testing.T) {
 		<-start
 		for i := 0; i < packets; i++ {
 			d.access.Lock()
-			d.packetMap.Delete(uint16(i))
+			if item := d.packetMap[uint16(i)]; item != nil {
+				d.remove(item)
+			}
 			d.access.Unlock()
 		}
 	}()

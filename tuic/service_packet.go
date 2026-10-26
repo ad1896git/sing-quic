@@ -65,7 +65,7 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage, udpStream bool)
 				delete(s.udpConnMap, sessionID)
 			}
 			s.udpAccess.Unlock()
-		})
+		}, s.defragBudget)
 		udpConn.sessionID = sessionID
 		s.udpConnMap[sessionID] = udpConn
 	}

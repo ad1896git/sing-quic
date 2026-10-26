@@ -70,8 +70,8 @@ func lifecycleTestCreate(t *testing.T, s *serverSession[string], h *lifecycleTes
 
 func TestUDPSessionLifecycleFirstPacket(t *testing.T) {
 	s, h := lifecycleTestSession(t)
-	zero := newUDPPacketConn(s.ctx, nil, false, true, func() {})
-	other := newUDPPacketConn(s.ctx, nil, false, true, func() {})
+	zero := newUDPPacketConn(s.ctx, nil, false, true, func() {}, nil)
+	other := newUDPPacketConn(s.ctx, nil, false, true, func() {}, nil)
 	s.udpConnMap[0], s.udpConnMap[9] = zero, other
 	_, conn := lifecycleTestCreate(t, s, h, 7)
 	if err := conn.Close(); err != nil {
@@ -194,7 +194,7 @@ func TestUDPSessionLifecycleDissociateTwice(t *testing.T) {
 	s, h := lifecycleTestSession(t)
 	s.connDone, s.authDone = make(chan struct{}), make(chan struct{})
 	close(s.authDone)
-	zero := newUDPPacketConn(s.ctx, nil, false, true, func() {})
+	zero := newUDPPacketConn(s.ctx, nil, false, true, func() {}, nil)
 	s.udpConnMap[0] = zero
 	old, oldConn := lifecycleTestCreate(t, s, h, 7)
 	for i := 0; i < 2; i++ {

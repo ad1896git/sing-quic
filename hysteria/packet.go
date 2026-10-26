@@ -2,6 +2,7 @@ package hysteria
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -16,7 +17,6 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -139,7 +139,7 @@ type udpPacketConn struct {
 	readWaitOptions N.ReadWaitOptions
 }
 
-func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, onDestroy func()) *udpPacketConn {
+func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, onDestroy func(), budget *defragBudget) *udpPacketConn {
 	ctx, cancel := common.ContextWithCancelCause(ctx)
 	return &udpPacketConn{
 		ctx:       ctx,
@@ -147,7 +147,7 @@ func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, onDestroy f
 		quicConn:  quicConn,
 		data:      make(chan *udpMessage, 64),
 		udpMTU:    1200 - 3,
-		defragger: newUDPDefragger(),
+		defragger: newUDPDefragger(budget),
 		onDestroy: onDestroy,
 	}
 }
@@ -310,6 +310,7 @@ func (c *udpPacketConn) Close() error {
 func (c *udpPacketConn) closeWithError(err error) {
 	c.closeOnce.Do(func() {
 		c.cancel(err)
+		c.defragger.close()
 		c.onDestroy()
 	})
 }
@@ -330,46 +331,142 @@ func (c *udpPacketConn) SetWriteDeadline(t time.Time) error {
 	return os.ErrInvalid
 }
 
-type udpDefragger struct {
-	// access protects all cache operations and receive-side fragment ownership.
-	access    sync.Mutex
-	packetMap *cache.LruCache[uint16, *packetItem]
+const (
+	defragSessionItems    = 256
+	defragSessionBytes    = 1 << 20
+	defragConnectionItems = 4096
+	defragConnectionBytes = 8 << 20
+	defragMessageBytes    = 65535
+)
+
+// defragBudget is shared by every UDP session on one QUIC connection.
+// Lock ordering is udpDefragger.access followed by defragBudget.access.
+type defragBudget struct {
+	access             sync.Mutex
+	items, bytes       int
+	maxItems, maxBytes int
+	lifetime           time.Duration // Immutable after construction; tests may shorten it.
 }
 
-func newUDPDefragger() *udpDefragger {
-	return &udpDefragger{
-		packetMap: cache.New(
-			cache.WithAge[uint16, *packetItem](10),
-			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
-			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
-				// sing v0.4.1 evicts synchronously during cache operations; it has no janitor.
-				// feed holds udpDefragger.access before taking the cache lock.
-				// Do not lock here: the callback already runs under both locks.
-				value.releaseMessages()
-			}),
-		),
+func newDefragBudget(maxItems, maxBytes int) *defragBudget {
+	return &defragBudget{maxItems: maxItems, maxBytes: maxBytes, lifetime: 10 * time.Second}
+}
+
+func (b *defragBudget) reserve(items, bytes int) bool {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.items+items > b.maxItems || b.bytes+bytes > b.maxBytes {
+		return false
 	}
+	b.items += items
+	b.bytes += bytes
+	return true
+}
+
+func (b *defragBudget) release(items, bytes int) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	b.items -= items
+	b.bytes -= bytes
+}
+
+type udpDefragger struct {
+	// access protects all state and receive-side fragment ownership.
+	access    sync.Mutex
+	packetMap map[uint16]*packetItem
+	queue     list.List
+	bytes     int
+	budget    *defragBudget
+	now       func() time.Time
+	closed    bool
+}
+
+func newUDPDefragger(budget *defragBudget) *udpDefragger {
+	if budget == nil {
+		budget = newDefragBudget(defragConnectionItems, defragConnectionBytes)
+	}
+	return &udpDefragger{packetMap: make(map[uint16]*packetItem), budget: budget, now: time.Now}
 }
 
 type packetItem struct {
+	packetID uint16
 	messages []*udpMessage
 	count    uint8
+	deadline time.Time
+	timer    *time.Timer
+	bytes    int
+	element  *list.Element
 }
 
-// releaseMessages releases owned receive buffers. The defragger mutex must be held.
-func (p *packetItem) releaseMessages() {
-	for _, message := range p.messages {
+// remove returns the item's reservations exactly once. access must be held.
+func (d *udpDefragger) remove(item *packetItem) {
+	if item.timer != nil {
+		item.timer.Stop()
+		item.timer = nil
+	}
+	delete(d.packetMap, item.packetID)
+	d.queue.Remove(item.element)
+	d.bytes -= item.bytes
+	d.budget.release(1, item.bytes)
+	item.bytes = 0
+	for _, message := range item.messages {
 		if message != nil {
 			message.releaseMessage()
 		}
 	}
-	p.messages = nil
-	p.count = 0
+	item.messages = nil
+	item.count = 0
+}
+
+func (d *udpDefragger) close() {
+	d.access.Lock()
+	defer d.access.Unlock()
+	d.closed = true
+	for d.queue.Len() > 0 {
+		d.remove(d.queue.Front().Value.(*packetItem))
+	}
+}
+
+// expire also handles callbacks already running when remove stops the timer.
+func (d *udpDefragger) expire(item *packetItem) {
+	d.access.Lock()
+	defer d.access.Unlock()
+	if !d.closed && d.packetMap[item.packetID] == item {
+		d.remove(item)
+	}
 }
 
 func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
+	var created *packetItem
 	d.access.Lock()
-	defer d.access.Unlock()
+	defer func() {
+		d.access.Unlock()
+		if created == nil {
+			return
+		}
+		// AfterFunc must run without either lock held. Removal or even expiry
+		// may win the race to install the timer, so recheck under access.
+		timer := time.AfterFunc(d.budget.lifetime, func() { d.expire(created) })
+		d.access.Lock()
+		if !d.closed && d.packetMap[created.packetID] == created {
+			created.timer = timer
+		} else {
+			timer.Stop()
+		}
+		d.access.Unlock()
+	}()
+	now := d.now()
+	for front := d.queue.Front(); front != nil; front = d.queue.Front() {
+		item := front.Value.(*packetItem)
+		if now.Before(item.deadline) {
+			break
+		}
+		d.remove(item)
+	}
+	if d.closed {
+		m.releaseMessage()
+		return nil
+	}
 	if m.fragmentTotal <= 1 {
 		return m
 	}
@@ -377,35 +474,52 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		m.releaseMessage()
 		return nil
 	}
-	item, _ := d.packetMap.LoadOrStore(m.packetID, newPacketItem)
-	if int(m.fragmentTotal) != len(item.messages) {
-		item.releaseMessages()
-		item.messages = make([]*udpMessage, m.fragmentTotal)
-		item.count = 1
-		item.messages[m.fragmentID] = m
-		return nil
+	item := d.packetMap[m.packetID]
+	if item != nil && int(m.fragmentTotal) != len(item.messages) {
+		d.remove(item)
+		item = nil
 	}
-	if item.messages[m.fragmentID] != nil {
+	if item != nil && item.messages[m.fragmentID] != nil {
 		m.releaseMessage()
 		return nil
 	}
+	size := m.data.Len()
+	if size > defragMessageBytes || (item != nil && item.bytes+size > defragMessageBytes) {
+		if item != nil {
+			d.remove(item)
+		}
+		m.releaseMessage()
+		return nil
+	}
+	newItems := 0
+	if item == nil {
+		newItems = 1
+	}
+	if len(d.packetMap)+newItems > defragSessionItems || d.bytes+size > defragSessionBytes || !d.budget.reserve(newItems, size) {
+		m.releaseMessage()
+		return nil
+	}
+	if item == nil {
+		item = &packetItem{packetID: m.packetID, messages: make([]*udpMessage, m.fragmentTotal), deadline: now.Add(10 * time.Second)}
+		item.element = d.queue.PushBack(item)
+		d.packetMap[m.packetID] = item
+		created = item
+	}
+	d.bytes += size
+	item.bytes += size
 	item.messages[m.fragmentID] = m
 	item.count++
 	if int(item.count) != len(item.messages) {
 		return nil
 	}
-	defer item.releaseMessages()
+	defer d.remove(item)
 	newMessage := allocMessage()
 	newMessage.sessionID = m.sessionID
 	newMessage.packetID = m.packetID
 	newMessage.host = item.messages[0].host
 	newMessage.port = item.messages[0].port
-	var finalLength int
-	for _, message := range item.messages {
-		finalLength += message.data.Len()
-	}
-	if finalLength > 0 {
-		newMessage.data = buf.NewSize(finalLength)
+	if item.bytes > 0 {
+		newMessage.data = buf.NewSize(item.bytes)
 		for _, message := range item.messages {
 			newMessage.data.Write(message.data.Bytes())
 		}
@@ -413,10 +527,6 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 	}
 	newMessage.release()
 	return nil
-}
-
-func newPacketItem() *packetItem {
-	return new(packetItem)
 }
 
 func decodeUDPMessage(message *udpMessage, data []byte) error {

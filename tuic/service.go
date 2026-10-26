@@ -178,6 +178,8 @@ func (s *Service[U]) handleConnection(connection quic.Connection) {
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+
+		defragBudget: newDefragBudget(defragConnectionItems, defragConnectionBytes),
 	}
 	session.handle()
 }
@@ -197,6 +199,8 @@ type serverSession[U comparable] struct {
 	authUser    U
 	udpAccess   sync.RWMutex
 	udpConnMap  map[uint16]*udpPacketConn
+
+	defragBudget *defragBudget
 }
 
 func (s *serverSession[U]) handle() {
