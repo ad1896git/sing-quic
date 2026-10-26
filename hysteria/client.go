@@ -212,6 +212,10 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if err != nil {
 		return nil, err
 	}
+	deadline, _ := ctx.Deadline()
+	if err = controlStream.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
 	err = WriteClientHello(controlStream, ClientHello{
 		SendBPS: c.sendBPS,
 		RecvBPS: c.receiveBPS,
@@ -229,6 +233,9 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	stop()
 	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err = controlStream.SetDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
 	quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), c.brutalDebug, c.logger))
