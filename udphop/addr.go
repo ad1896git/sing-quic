@@ -72,13 +72,16 @@ func ResolveUDPHopAddr(addr, portStr string) (*UDPHopAddr, error) {
 			if start > end {
 				start, end = end, start
 			}
+			if start == 0 {
+				return nil, InvalidPortError{portStr}
+			}
 			for i := start; i <= end; i++ {
 				result.Ports = append(result.Ports, uint16(i))
 			}
 		} else {
 			// Single port
 			port, err := strconv.ParseUint(portStr, 10, 16)
-			if err != nil {
+			if err != nil || port == 0 {
 				return nil, InvalidPortError{portStr}
 			}
 			result.Ports = append(result.Ports, uint16(port))
