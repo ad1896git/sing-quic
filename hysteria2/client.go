@@ -149,8 +149,14 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		}
 	}()
 	if c.hopPorts != "" {
-		packetConn, err = hop.NewUDPHopPacketConn(c.serverAddr.AddrString(), c.hopPorts, c.hopInterval, func() (net.PacketConn, error) {
-			return c.dialer.ListenPacket(c.ctx, c.serverAddr)
+		// Hop to the address the dialer resolved with the host's DNS policy;
+		// never resolve the server name again with the system resolver.
+		hopAddr := M.SocksaddrFromNet(udpConn.RemoteAddr()).Unwrap()
+		if !hopAddr.IsIP() {
+			return nil, E.New("port hopping needs a resolved server address, dialer returned ", udpConn.RemoteAddr())
+		}
+		packetConn, err = hop.NewUDPHopPacketConn(hopAddr.AddrString(), c.hopPorts, c.hopInterval, func() (net.PacketConn, error) {
+			return c.dialer.ListenPacket(c.ctx, hopAddr)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("hop.NewUDPHopPacketConn: %w", err)
