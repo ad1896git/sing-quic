@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	M "github.com/sagernet/sing/common/metadata"
@@ -44,6 +45,34 @@ func (d *hopResolutionDialer) ListenPacket(ctx context.Context, addr M.Socksaddr
 	return d.hopFinalizeNetworkDialer.ListenPacket(ctx, addr)
 }
 
+// Keep real QUIC I/O, but retain its default congestion controller. Replacing
+// the controller races with ACK processing in the pinned quic-go; this test
+// exercises address resolution and resource ownership, not congestion control.
+type hopResolutionTLS struct {
+	hopFinalizeNetworkTLS
+	connSyncQUICBase
+}
+
+func (c hopResolutionTLS) CreateTransport(packet net.PacketConn, ptr *quic.EarlyConnection, addr M.Socksaddr, config *quic.Config) http.RoundTripper {
+	return &http3.RoundTripper{
+		TLSClientConfig: c.config,
+		QUICConfig:      config,
+		Dial: func(ctx context.Context, _ string, tlsConfig *tls.Config, quicConfig *quic.Config) (quic.EarlyConnection, error) {
+			conn, err := quic.DialEarly(ctx, packet, addr.UDPAddr(), tlsConfig, quicConfig)
+			if err != nil {
+				return nil, err
+			}
+			wrapped := hopResolutionQUIC{conn}
+			*ptr = wrapped
+			return wrapped, nil
+		},
+	}
+}
+
+type hopResolutionQUIC struct{ quic.EarlyConnection }
+
+func (hopResolutionQUIC) SetCongestionControl(congestion.CongestionControl) {}
+
 func TestHopResolutionUsesDialerAddress(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -61,9 +90,7 @@ func TestHopResolutionUsesDialerAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	peers := make(chan quic.Connection, 1)
 	serverDone := make(chan struct{})
 	go func() {
@@ -72,23 +99,71 @@ func TestHopResolutionUsesDialerAddress(t *testing.T) {
 		if err != nil {
 			return
 		}
+		// Listener.Close in the pinned quic-go can leave accepted peers alive.
+		// Own the peer explicitly, including when setup fails before it is read.
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			select {
+			case <-ctx.Done():
+				_ = peer.CloseWithError(0, "test context ended")
+			case <-peer.Context().Done():
+			}
+		}()
+		defer func() {
+			_ = peer.CloseWithError(0, "test server shutdown")
+			<-peerDone
+		}()
 		peers <- peer
 		server := &http3.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{Rx: 1000000})
 			w.WriteHeader(protocol.StatusAuthOK)
 		})}
+		defer server.Close()
 		_ = server.ServeQUICConn(peer)
 	}()
-	defer func() { cancel(); _ = listener.Close(); hopFinalizeWait(t, serverDone) }()
 	resolved := M.ParseSocksaddr(listener.Addr().String())
 	d := &hopResolutionDialer{resolved: resolved}
 	c := &Client{
 		ctx: ctx, dialer: d, serverAddr: M.ParseSocksaddrHostPort(hopResolutionServer, resolved.Port),
-		tlsConfig:  hopFinalizeNetworkTLS{config: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}},
+		tlsConfig:  hopResolutionTLS{hopFinalizeNetworkTLS: hopFinalizeNetworkTLS{config: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}}},
 		quicConfig: &quic.Config{}, hopPorts: strconv.Itoa(int(resolved.Port)), hopInterval: 5 * time.Second,
 		udpDisabled: true, sendBPS: 1000000, receiveBPS: 1000000,
 	}
-	defer c.CloseWithError(net.ErrClosed)
+	defer func() {
+		// Use a fresh deadline: the handshake context may already have expired.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		cancel()
+		clientDone := make(chan struct{})
+		go func() {
+			defer close(clientDone)
+			_ = c.CloseWithError(net.ErrClosed)
+		}()
+		listenerDone := make(chan struct{})
+		go func() {
+			defer close(listenerDone)
+			_ = listener.Close()
+		}()
+		clientClosed := hopResolutionWait(t, cleanupCtx, "client close", clientDone)
+		hopResolutionWait(t, cleanupCtx, "listener close", listenerDone)
+		hopResolutionWait(t, cleanupCtx, "server and accepted peer", serverDone)
+		if !clientClosed {
+			return
+		}
+		if d.rawConn != nil {
+			hopResolutionWait(t, cleanupCtx, "raw socket close", d.rawConn.closed)
+			if n := d.rawConn.closes.Load(); n != 1 {
+				t.Errorf("raw socket closes = %d, want 1", n)
+			}
+		}
+		for i, packet := range d.packets {
+			hopResolutionWait(t, cleanupCtx, "hop socket "+strconv.Itoa(i)+" close", packet.closed)
+			if n := packet.closes.Load(); n != 1 {
+				t.Errorf("hop socket %d closes = %d, want 1", i, n)
+			}
+		}
+	}()
 	if _, err := c.offer(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +183,23 @@ func TestHopResolutionUsesDialerAddress(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+}
+
+// Report the specific owner that did not exit without skipping other checks.
+func hopResolutionWait(t *testing.T, ctx context.Context, name string, done <-chan struct{}) bool {
+	t.Helper()
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Errorf("%s did not finish: %v", name, ctx.Err())
+		return false
+	}
+	return true
 }
 
 // unresolvedRaw models a dialer that could not resolve the server, for
