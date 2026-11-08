@@ -29,15 +29,18 @@ SEC_MATRIX_GO=/path/to/go1.22.12 python3 -B -m unittest discover \
   -s scripts -p test_security_matrix.py -v
 ```
 
-The self-tests reject panics (including actual post-test `TestMain` and
-background panics), silent post-test exits 0/2, signals, hangs, Go timeouts,
-build/converter failures, lost converter output, fatal/race diagnostics,
-a different error cause, vacuous passes, missing/extra/duplicate rows, invalid
-lifecycles, and malformed/non-JSON output. They also reproduce Go's silent
-normalization of a binary's exit 2 into outer exit 1, then require rejection by
-the same direct-binary path used in the matrix. Process probes create a temporary
-standard-library-only Go module and remove it after the checks. Positive controls
-require the exact failures and accept valid interleaving/output chunking.
+The self-tests apply the same attacks to **both PASS and XFAIL** expectations:
+post-test and background panics, silent exits, failed/fatal assertions (including
+subtests and another goroutine), a TestMain suppressing those failures with exit
+0, actual races under `-race`, signals, hangs, test deadlines, build/converter
+failures, stale/missing binaries, lost output, wrong diagnostics, vacuous runs,
+missing/extra/duplicate tests and packages, unexpected skips, corrupt lifecycles,
+and malformed/raw output. Real stdlib-only Go probes use the production row
+executor and classifier, with bounded subprocess deadlines and cleanup. Controls
+accept both expected outcomes, package interleaving, and split output chunks.
+The suite also independently reproduces Go's exit-2 normalization and dr2's
+failed-assertion/package-pass contradiction via `go test -json`, then proves the
+shared production path rejects both.
 
 The standalone set uses this module's unchanged `go.mod`/`go.sum`: sing 0.4.1,
 quic-go 0.46.0-beta.4. The shipped overlay uses nekoray
@@ -80,33 +83,56 @@ This command **exits 1** with `PROTOCOL_VIOLATION (local): DATAGRAM frame too
 large` for each case. Add `-modfile` for the generated shipped overlay, or the
 external-link flag on macOS.
 
-For each dependency set, the runner instead builds each selected package with
-`go test -c` and directly executes its fresh binary with
-`-test.v=test2json -test.count=1 -test.timeout=180s -test.run=<selection>`.
-It owns each process and records its actual OS exit status using `Popen.wait`.
-This avoids `go test`'s normalization of silent binary exit 2 into outer exit 1.
-Each build must exit 0 without diagnostics; **each binary itself must exit 1**,
-without hitting the outer 300-second deadline. A timeout kills/reaps the process
-group and fails regardless of the transcript.
+## One outcome classifier for every row
 
-Only after a binary exits, `go tool test2json -p <package>` reads its completed
-raw log from stdin; the converter never runs the binary. Conversion must exit 0.
-All raw UTF-8 output must survive in the JSON Output events, except Go's known
-line-leading marker and selected-test NAME controls. Lost/added diagnostics,
-invalid bytes, unknown NAME controls, or any disagreement fail verification.
-The raw logs, decoded JSONL, actual binary exits, exact commands and deadlines
-are preserved in the CI artifacts.
+Every PASS and XFAIL row uses `run_row` and `verify_outcome`. There is no
+separate permissive PASS branch. The runner builds each selected package with
+`go test -c`, including that row's tags, race flag, and dependency modfile, then
+directly runs its fresh binary with `-test.v=test2json -test.count=1` and a
+180-second test deadline. Python owns the process and records `Popen.wait()`'s
+real OS status. PASS binaries must exit 0; XFAIL binaries must exit 1. A build
+must exit 0 without diagnostics. A stale executable is removed before building;
+a missing executable fails. Outer 300-second deadlines kill and reap the process
+group. Neither `go test` nor `test2json` can normalize the captured binary status.
 
-XFAIL requires agreement between those direct statuses and the entire decoded
-outcome: exactly the 18 named failing leaves with one exact transport diagnostic
-each, three failing parents, and three final package failures. The verifier
-allowlists the complete lifecycle and output, including the binary's final
-`FAIL` line; it rejects unknown JSON fields/actions and duplicate JSON keys.
-An exit 1 alone or a matching diagnostic alone never establishes XFAIL.
-Package-level/raw stderr diagnostics fail even after all expected failures.
-A panic, fatal error, race, build/converter failure, timeout, changed error,
-pass, skip, missing/extra/duplicate row, truncated/invalid lifecycle, unexpected
-status, or other output fails the matrix. Normal rows retain the explicit skips.
+After completion, `go tool test2json -p <package>` reads the captured combined
+stdout/stderr from stdin. Conversion must succeed. All raw UTF-8 output must
+survive in the JSON Output events in source order, except Go's line-leading
+framing marker and NAME controls for the exact expected tests (or empty reset).
+Dropped/added diagnostics, invalid bytes or unknown controls fail closed. Raw
+logs, JSONL, statuses, commands, selected environment, and deadlines are retained.
+
+`scripts/security-matrix-tests.json` is a reviewed, explicit inventory of every
+normal test/subtest, the existing stress skip's exact reason, and the packages
+without tests. It was checked against every tag/race/dependency result at the
+reviewed head `4e9898ee`; it is **never regenerated from the current run**. Debug
+adds its one build-tagged test; the boundary selection filters the inventory;
+the opt-in expectation names the three parents and 18 known leaves explicitly.
+Changes to test names, test coverage or allowed output require a reviewed update
+of this inventory. A bypassed `m.Run`, silently removed subtest, extra test or
+new skip cannot redefine success. Full rows also check `go list ./...` against
+the package inventory and run `go build ./...` under the row's flags, covering
+packages without tests; those five packages are recorded as `[no test files]`.
+
+The shared classifier requires each package/test to start and terminate exactly
+once with its expected action. Children must complete before their parent; every
+named test must exist and no extra test is accepted. Output must match the
+complete pinned Go grammar: RUN, the exact expected diagnostic for an allowed
+skip or known failure, terminal PASS/SKIP/FAIL, and final package PASS/FAIL.
+Passing tests currently emit no extra diagnostics, so unexpected logs also fail
+and require review. Unknown JSON fields/actions, duplicate keys, output outside
+a running lifecycle and incomplete/truncated transcripts fail. Tests with an
+unexpected fail action are rejected even if TestMain returns 0 and the package
+reports pass. Failures in subtests, other goroutines, cleanup and the race
+detector cannot be hidden by a successful outer status.
+
+XFAIL additionally requires one exact `PROTOCOL_VIOLATION (local): DATAGRAM frame
+too large` at each named `low_datagram_test.go` assertion, exactly 18 failing
+leaves, three failing parents/packages, and no skips. A distinct
+`DatagramTooLargeError`, remote error, added assertion, panic, race or trailing
+diagnostic fails. Normal rows require their 78 passing datagram leaves and 18
+explicit known-failure skips, including payload/destination/receipt assertions.
+An exit status or matching diagnostic alone never establishes a green row.
 
 ## DEFECT: KI-LOWDGRAM (P2, shipped affected)
 

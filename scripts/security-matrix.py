@@ -5,6 +5,7 @@ import argparse
 from collections import defaultdict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -25,85 +26,153 @@ PATCH_SHA256 = "ae512f0b0e7cf8c346f223f34ebd8846fa848b281fb50b5b7ce7b488fb29cf4c
 PROTOCOLS = ["hysteria", "hysteria2", "tuic"]
 
 
-def verify_known_failure(transcript, binary_exits):
-    """Accept only the complete, named KI-LOWDGRAM failure transcript.
+MODULE = "github.com/sagernet/sing-quic"
+PARENT = "TestLowDatagramRoundTrip"
+SIGNATURE = "PROTOCOL_VIOLATION (local): DATAGRAM frame too large"
+KNOWN_SKIP = ("KNOWN-FAIL/XFAIL KI-LOWDGRAM: peer max datagram limit ignored; "
+              "pending owner/orchestrator decision; set NKR_TEST_LOWDGRAM=1 to reproduce")
+BOUNDARIES = "^(TestFragmentBounds|TestWaitReadPacket|TestLowDatagram)"
 
-    Allowlist output as well as events: Go can emit a TestMain/background panic
-    after all expected leaves fail, without adding another failing test event.
-    Unknown output (including non-JSON stderr) must therefore fail closed.
+
+def expected_outcomes(known=False, debug=False, boundaries=False):
+    """Reviewed inventory, independent of the test execution being classified.
+
+    Never learn expected tests from this run: a bypassed m.Run or removed subtest
+    would otherwise redefine success. Inventory changes require a reviewed edit.
+    Each entry is (terminal action, exact diagnostic), including allowed skips.
+    """
+    manifest = json.loads(Path(__file__).with_name("security-matrix-tests.json").read_text())
+    expected = {}
+    for package, tests in manifest["tests"].items():
+        if (known or boundaries) and package not in {f"{MODULE}/{p}" for p in PROTOCOLS}:
+            continue
+        selected = {test: ("pass", None) for test in tests
+                    if not boundaries or re.match(BOUNDARIES, test)}
+        if debug and not (known or boundaries) and package == f"{MODULE}/hysteria":
+            selected["TestDuplicateUDPSession"] = ("pass", None)
+        if known:
+            selected = {PARENT: ("fail", None)}
+        for test in list(selected):
+            if test in manifest["skips"]:
+                selected[test] = ("skip", manifest["skips"][test])
+        if package in {f"{MODULE}/{p}" for p in PROTOCOLS}:
+            for api in ["false", "true"]:
+                for size in [255, 256, 4096]:
+                    test = f"{PARENT}/frame=64/packet={api}/size={size}"
+                    selected[test] = ("fail", SIGNATURE) if known else ("skip", KNOWN_SKIP)
+        expected[package] = selected
+    return expected
+
+
+def verify_package_inventory(listed, expected, no_tests):
+    wanted = {p: "tests" for p in expected}
+    wanted.update({p: "no-tests" for p in no_tests})
+    observed = {}
+    for line in listed.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] in observed:
+            raise RuntimeError("invalid/duplicate package inventory")
+        observed[fields[0]] = fields[1]
+    if observed != wanted:
+        raise RuntimeError("package/test inventory changed; review the manifest")
+
+
+def verify_outcome(transcript, binary_exits, expected, raw_by_package):
+    """One fail-closed classifier for every PASS and XFAIL row.
+
+    Require agreement among owned binary statuses, lossless raw/JSON output,
+    exact test inventory, lifecycle actions, and the entire output grammar.
+    There is no success shortcut for either expected outcome.
     """
     def reject(reason):
-        raise RuntimeError(f"known-failure result changed: {reason}")
+        raise RuntimeError(f"row outcome rejected: {reason}")
 
-    parent = "TestLowDatagramRoundTrip"
-    leaves = {f"{parent}/frame=64/packet={api}/size={size}"
-              for api in ["false", "true"] for size in [255, 256, 4096]}
-    packages = {f"github.com/sagernet/sing-quic/{p}" for p in PROTOCOLS}
-    # These are Popen.wait() results from the binaries themselves, never the
-    # normalized status of go test or test2json. Require all three sources.
-    if (not isinstance(binary_exits, dict) or set(binary_exits) != packages or
-            any(type(code) is not int or code != 1 for code in binary_exits.values())):
-        reject(f"expected each test binary to exit 1, got {binary_exits!r}")
-    expected = {(p, t) for p in packages for t in leaves | {parent}}
-    # Each package/test must start once, fail once, and emit only its expected
-    # transcript between those events. Sets alone would hide duplicate rows.
+    packages = set(expected)
+    wanted = {(p, t): action for p, tests in expected.items() for t, (action, _) in tests.items()}
+    package_actions = {p: "fail" if any(a == "fail" for a, _ in tests.values()) else "pass"
+                       for p, tests in expected.items()}
+    if (not packages or any(not tests for tests in expected.values()) or
+            not isinstance(binary_exits, dict) or set(binary_exits) != packages or
+            any(type(code) is not int or code != (1 if package_actions[p] == "fail" else 0)
+                for p, code in binary_exits.items())):
+        reject(f"unexpected direct binary statuses: {binary_exits!r}")
+    wanted.update({(p, None): a for p, a in package_actions.items()})
     states = {}
     output = defaultdict(str)
+    by_package = defaultdict(list)
     for number, line in enumerate(transcript.splitlines(), 1):
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    reject(f"duplicate JSON field {key!r} at line {number}")
+                result[key] = value
+            return result
         try:
-            def unique_fields(pairs):
-                result = {}
-                for key, value in pairs:
-                    if key in result:
-                        reject(f"duplicate JSON field {key!r} at line {number}")
-                    result[key] = value
-                return result
-            event = json.loads(line, object_pairs_hook=unique_fields)
+            event = json.loads(line, object_pairs_hook=unique_fields,
+                               parse_constant=lambda value: reject(f"nonfinite JSON value: {value}"))
         except ValueError:
             reject(f"non-JSON output at line {number}: {line!r}")
         if not isinstance(event, dict):
             reject(f"invalid event at line {number}")
         package, test = event.get("Package"), event.get("Test")
         if (not isinstance(package, str) or package not in packages or
-                ("Test" in event and (not isinstance(test, str) or (package, test) not in expected))):
-            reject(f"unexpected package/test at line {number}: {package!r}/{test!r}")
+                ("Test" in event and not isinstance(test, str))):
+            reject(f"unexpected package/test at line {number}")
         key = (package, test)
+        if key not in wanted:
+            reject(f"extra test: {key}")
         action = event.get("Action")
+        if not isinstance(action, str):
+            reject(f"invalid action at line {number}")
+        if ("Elapsed" in event and (type(event["Elapsed"]) not in {int, float} or
+                                    not math.isfinite(event["Elapsed"]) or event["Elapsed"] < 0)):
+            reject(f"invalid elapsed time at line {number}")
+        if "Time" in event and not isinstance(event["Time"], str):
+            reject(f"invalid timestamp at line {number}")
         allowed = {"Action", "Package", "Test", "Time", "Elapsed"}
         if action == "output":
             allowed.add("Output")
         if set(event) - allowed:
             reject(f"unexpected event fields at line {number}")
-        if test is not None and states.get((package, None)) != "running":
-            reject(f"test event outside running package: {key}")
-        if test in leaves and states.get((package, parent)) != "running":
-            reject(f"leaf event outside running parent: {key}")
-        if action == "fail" and test in {None, parent}:
-            children = leaves if test == parent else leaves | {parent}
-            if any(states.get((package, child)) != "failed" for child in children):
-                reject(f"parent/package failed before its children: {key}")
+        if test is not None:
+            ancestors = [None] + [t for t in expected[package] if test.startswith(t + "/")]
+            if any(states.get((package, t)) != "running" for t in ancestors):
+                reject(f"test outside running parent/package: {key}")
+        if action in {"pass", "fail", "skip"}:
+            children = [t for t in expected[package] if test is None or t.startswith(test + "/")]
+            if any(states.get((package, t)) != wanted[(package, t)] for t in children):
+                reject(f"parent/package terminated before its children: {key}")
         if action == ("run" if test is not None else "start") and key not in states:
             states[key] = "running"
         elif action == "output" and states.get(key) == "running" and isinstance(event.get("Output"), str):
             output[key] += event["Output"]
-        elif action == "fail" and states.get(key) == "running":
-            states[key] = "failed"
+        elif action == wanted[key] and states.get(key) == "running":
+            states[key] = action
         else:
             reject(f"unexpected {action!r} event/state for {key} at line {number}")
-    all_keys = expected | {(p, None) for p in packages}
-    if set(states) != all_keys or any(s != "failed" for s in states.values()):
+        by_package[package].append(line)
+    if states != wanted:
         reject("missing or incomplete package/test rows")
     duration = r"[0-9]+\.[0-9]+"
-    for package, test in all_keys:
+    for (package, test), action in wanted.items():
         if test is None:
-            pattern = r"FAIL\n"
+            pattern = action.upper() + r"\n"
         else:
-            diagnostic = (r"    low_datagram_test\.go:[0-9]+: "
-                          r"PROTOCOL_VIOLATION \(local\): DATAGRAM frame too large\n") if test in leaves else ""
-            pattern = (rf"=== RUN   {re.escape(test)}\n" + diagnostic +
-                       rf"[ \t]*--- FAIL: {re.escape(test)} \({duration}s\)\n")
+            diagnostic = expected[package][test][1]
+            detail = (r"    [A-Za-z0-9_]+_test\.go:[0-9]+: " + re.escape(diagnostic) + r"\n"
+                      if diagnostic is not None else "")
+            if action == "fail" and diagnostic is not None:
+                # The known defect must originate at the round-trip assertion.
+                detail = (r"    low_datagram_test\.go:[0-9]+: " + re.escape(diagnostic) + r"\n")
+            pattern = (rf"=== RUN   {re.escape(test)}\n" + detail +
+                       rf"[ \t]*--- {action.upper()}: {re.escape(test)} \({duration}s\)\n")
         if not re.fullmatch(pattern, output[(package, test)]):
             reject(f"unexpected output for {package}/{test}: {output[(package, test)]!r}")
+    if not isinstance(raw_by_package, dict) or set(raw_by_package) != packages:
+        reject("missing/extra raw binary transcript")
+    for package in packages:
+        verify_conversion(raw_by_package[package], "\n".join(by_package[package]), expected[package])
 
 
 LOW_DATAGRAM_SELECTION = "^TestLowDatagramRoundTrip/frame=64/packet=.*/size=(255|256|4096)$"
@@ -115,7 +184,7 @@ def capture_command(cmd, log, cwd, env, records, timeout=300, stdin=None):
     record = {"command": cmd, "cwd": str(cwd), "timeout_seconds": timeout,
               "log": str(log), "stdin": str(stdin) if stdin else None,
               "environment": {k: env.get(k) for k in
-                              ["GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED", "NKR_TEST_LOWDGRAM"]}}
+                              ["GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED", "NKR_TEST_LOWDGRAM", "GORACE"]}}
     records.append(record)
     start = time.monotonic()
     with log.open("wb") as stream:
@@ -144,7 +213,7 @@ def require_success(record):
                            f"{shlex.join(record['command'])}; see {record['log']}")
 
 
-def verify_conversion(raw, transcript):
+def verify_conversion(raw, transcript, tests):
     """Ensure the converter discarded no diagnostics or undecodable bytes.
 
     Go's test2json framing removes line-leading ^V markers and NAME controls;
@@ -157,8 +226,10 @@ def verify_conversion(raw, transcript):
         decoded = "".join(e.get("Output", "") for e in events)
     except (UnicodeError, ValueError, AttributeError, TypeError) as error:
         raise RuntimeError("invalid test output/converter transcript") from error
-    name = (r"=== NAME  (?:TestLowDatagramRoundTrip"
-            r"(?:/frame=64/packet=(?:false|true)/size=(?:255|256|4096))?)?\n")
+    # NAME controls after the final record must not disappear unnoticed.
+    if not text.endswith(("PASS\n", "FAIL\n")):
+        raise RuntimeError("raw binary transcript lacks a final PASS/FAIL record")
+    name = r"=== NAME  (?:" + "|".join(re.escape(t) for t in tests) + r")?\n"
     expected = []
     for line in text.splitlines(keepends=True):
         if line.startswith("\x16"):
@@ -170,45 +241,42 @@ def verify_conversion(raw, transcript):
         raise RuntimeError("raw test output and JSON output disagree")
 
 
-def run_known_failure(go, root, out, prefix, mod, env, records, timeout=300,
-                      binary_timeout=300, test_timeout="180s"):
-    """Build, directly execute, then decode each binary's captured output.
-
-    test2json only reads a completed raw log from stdin: it never owns a test
-    process and cannot normalize its status. The verdict requires the captured
-    OS statuses AND the exact decoded lifecycle/output to agree. No shell/pipe.
-    """
-    exits = {}
-    transcripts = []
+def run_row(go, root, out, prefix, mod, env, records, expected, flags=(), selection=None,
+            timeout=300, binary_timeout=300, test_timeout="180s"):
+    """Every row builds fresh binaries, owns their execution, and classifies once."""
+    exits, raws, transcripts = {}, {}, []
     linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
-    for protocol in PROTOCOLS:
-        stem = f"{prefix}-{protocol}"
+    for package in expected:
+        relative = package.removeprefix(MODULE + "/")
+        stem = f"{prefix}-{relative.replace('/', '-')}"
         binary = out / f"{stem}.test"
+        # Never execute a leftover executable, even if a compiler exits 0 but
+        # fails to create its requested output.
+        binary.unlink(missing_ok=True)
         build_log = out / f"{stem}-build.log"
-        build = capture_command([go, "test", "-c", *mod, *linker, "-o", binary, f"./{protocol}"],
+        build = capture_command([go, "test", "-c", *mod, *linker, *flags, "-o", binary, f"./{relative}"],
                                 build_log, root, env, records, timeout)
         require_success(build)
         if build_log.read_bytes():
             raise RuntimeError(f"unexpected build output; see {build_log}")
         raw = out / f"{stem}-binary.log"
-        run = capture_command([binary, "-test.v=test2json", "-test.count=1",
-                               f"-test.timeout={test_timeout}", f"-test.run={LOW_DATAGRAM_SELECTION}"],
-                              raw, root, env, records, binary_timeout)
+        cmd = [binary, "-test.v=test2json", "-test.count=1", f"-test.timeout={test_timeout}"]
+        if selection:
+            cmd.append(f"-test.run={selection}")
+        run = capture_command(cmd, raw, root, env, records, binary_timeout)
         if run["timed_out"]:
             raise RuntimeError(f"test binary timed out; see {raw}")
-        package = f"github.com/sagernet/sing-quic/{protocol}"
         exits[package] = run["exit"]
+        raws[package] = raw.read_bytes()
         converted = out / f"{stem}.jsonl"
         conversion = capture_command([go, "tool", "test2json", "-p", package],
                                      converted, root, env, records, timeout, stdin=raw)
         require_success(conversion)
-        decoded = converted.read_text()
-        verify_conversion(raw.read_bytes(), decoded)
-        transcripts.append(decoded)
+        transcripts.append(converted.read_text())
     transcript = "".join(transcripts)
     (out / f"{prefix}.jsonl").write_text(transcript)
     (out / f"{prefix}-binary-exits.json").write_text(json.dumps(exits, indent=2) + "\n")
-    verify_known_failure(transcript, exits)
+    verify_outcome(transcript, exits, expected, raws)
     return exits
 
 
@@ -274,37 +342,33 @@ def main():
         command([go, "mod", "tidy", f"-modfile={modfile}"], "overlay-tidy.log")
         return [f"-modfile={modfile}"]
 
-    def test_row(dependency, name, mod, flags, packages, known=False):
+    def test_row(dependency, name, mod, flags, known=False):
         row = {"name": f"{dependency}/{name}", "result": "FAIL", "skips": []}
         rows.append(row)
-        filename = f"{dependency}-{name}.jsonl"
+        prefix = f"{dependency}-{name}"
         test_env = dict(env, NKR_TEST_LOWDGRAM="1") if known else env
-        row["evidence"] = filename
-        if known:
-            row["binary_exits"] = run_known_failure(
-                go, root, out, f"{dependency}-{name}", mod, test_env, metadata["commands"])
-            row["result"] = "XFAIL (18 reproduced; each binary exits 1)"
-        else:
-            # macOS 27 rejects Go 1.22 internal-linked binaries without LC_UUID.
-            linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
-            cmd = [go, "test", *mod, *linker, "-json", "-count=1", "-timeout=180s", *flags, *packages]
-            row["command"] = cmd
-            transcript = command(cmd, filename, command_env=test_env)
-            events = []
-            for line in transcript.splitlines():
-                try:
-                    events.append(json.loads(line))
-                except ValueError:
-                    pass
-            if not any(e.get("Action") == "pass" and "Test" not in e for e in events):
-                raise RuntimeError(f"no package pass events in {filename}")
-            for e in events:
-                if e.get("Action") == "skip":
-                    reason = "".join(x.get("Output", "") for x in events
-                                     if x.get("Package") == e["Package"] and x.get("Test") == e.get("Test")
-                                     and x.get("Action") == "output").strip()
-                    row["skips"].append({"package": e["Package"], "test": e.get("Test"), "reason": reason})
-            row["result"] = "PASS"
+        boundaries = name == "boundaries"
+        expected = expected_outcomes(known=known, debug="debug" in name, boundaries=boundaries)
+        build_flags = [f for f in flags if f.startswith("-tags=") or f == "-race"]
+        selection = LOW_DATAGRAM_SELECTION if known else BOUNDARIES if boundaries else None
+        if not (known or boundaries):
+            # Check the entire package inventory (including packages without
+            # tests) independently, and compile every package under these flags.
+            manifest = json.loads((root / "scripts/security-matrix-tests.json").read_text())
+            listed = command([go, "list", *mod, *build_flags, "-f",
+                              "{{.ImportPath}} {{if or .TestGoFiles .XTestGoFiles}}tests{{else}}no-tests{{end}}",
+                              "./..."], f"{prefix}-packages.log")
+            verify_package_inventory(listed, expected, manifest["no_tests"])
+            command([go, "build", *mod, *build_flags, "./..."], f"{prefix}-build-all.log")
+            row["skips"] += [{"package": p, "test": None, "reason": "[no test files]"}
+                             for p in manifest["no_tests"]]
+        row["evidence"] = f"{prefix}.jsonl"
+        row["binary_exits"] = run_row(go, root, out, prefix, mod, test_env, metadata["commands"],
+                                      expected, build_flags, selection)
+        row["skips"] += [{"package": p, "test": t, "reason": diagnostic}
+                         for p, tests in expected.items() for t, (action, diagnostic) in tests.items()
+                         if action == "skip"]
+        row["result"] = "XFAIL (18 reproduced; each binary exits 1)" if known else "PASS"
         print(f"{row['name']}: {row['result']}; skips={len(row['skips'])}", flush=True)
 
     try:
@@ -325,14 +389,9 @@ def main():
                 for race in [False, True]:
                     flags = ([f"-tags={tags}"] if tags else []) + (["-race"] if race else [])
                     name = (tags.replace(",", "-") or "standard") + ("-race" if race else "")
-                    test_row(dependency, name, mod, flags, ["./..."])
-            test_row(dependency, "boundaries", mod,
-                     ["-race", "-tags=debug,with_low_memory", "-run",
-                      "^(TestFragmentBounds|TestWaitReadPacket|TestLowDatagram)"],
-                     [f"./{p}" for p in PROTOCOLS])
-            test_row(dependency, "known-low-datagram", mod,
-                     ["-run", LOW_DATAGRAM_SELECTION],
-                     [f"./{p}" for p in PROTOCOLS], known=True)
+                    test_row(dependency, name, mod, flags)
+            test_row(dependency, "boundaries", mod, ["-race", "-tags=debug,with_low_memory"])
+            test_row(dependency, "known-low-datagram", mod, [], known=True)
     except (RuntimeError, OSError) as error:
         metadata["error"] = str(error)
         print(error, file=sys.stderr)
