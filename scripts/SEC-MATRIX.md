@@ -21,6 +21,19 @@ buffer ownership on write/retry errors. Existing opt-in stream burst stress
 tests remain skipped with their existing reason; this matrix is not a stress
 measurement or a full external-peer interoperability suite.
 
+Before either dependency set, the runner executes `scripts/test_security_matrix.py`
+and retains `verifier-self-tests.log`. To run these checks alone:
+
+```sh
+SEC_MATRIX_GO=/path/to/go1.22.12 python3 -B -m unittest discover \
+  -s scripts -p test_security_matrix.py -v
+```
+
+The self-tests reject panics (including an actual post-test `TestMain` panic),
+fatal/race/build diagnostics, timeouts, a different error cause, vacuous passes,
+missing/extra/duplicate rows, and non-JSON output. The process probe creates a
+temporary standard-library-only Go module and removes it after the check.
+
 The standalone set uses this module's unchanged `go.mod`/`go.sum`: sing 0.4.1,
 quic-go 0.46.0-beta.4. The shipped overlay uses nekoray
 `1127938594e4c67352124ff6362dc704bd0faeeb`, which pins sing-quic base
@@ -62,8 +75,16 @@ This command **exits 1** with `PROTOCOL_VIOLATION (local): DATAGRAM frame too
 large` for each case. Add `-modfile` for the generated shipped overlay, or the
 external-link flag on macOS. The runner executes this opt-in command for each
 dependency set and only records XFAIL if exactly these 18 leaf tests fail with
-that diagnostic. A timeout, build failure, changed outcome, or other failed
-test fails the matrix. Normal rows retain the explicit skips in their logs.
+that exact diagnostic, attributed to each named row, and the command exits 1.
+It validates the complete package/test lifecycle and allowlists all output:
+only the Go test run/failure framing, one exact transport diagnostic per leaf,
+and the three failing package summaries are accepted. Package-level or raw
+stderr diagnostics also fail verification, even after all 18 expected failures.
+A timeout, panic, fatal error, race, build failure, changed error, pass, skip,
+missing/extra/duplicate row, or any other output fails the matrix loudly.
+Normal rows retain the explicit skips in their logs.
+
+## DEFECT: KI-LOWDGRAM (P2, shipped affected)
 
 Proposed severity: **P2**, shipped affected. The defect is in quic-go's shared
 `connection.SendDatagram` size check, which takes the maximum of the peer limit
@@ -77,6 +98,14 @@ disrupting that peer's own connection. It is not an arbitrary unauthenticated
 network trigger. No crash, leak, or unbounded allocation was observed or shown by
 this repro; the transport queues are bounded. This is a scoped availability and
 interoperability defect, separate from the FU-D/KI-1 congestion races.
+
+These pinned quic-go versions advertise 16,383 bytes by default. Both default
+peers pass the exercised cases; this defect requires a smaller advertised bound
+from a configured peer or another implementation. The tested sizes are sample
+points, not a minimum failing size or proof that every larger payload fails.
+The review's deliberately injected process panic demonstrates a verifier gap,
+not a product crash. This PR tightens that verifier and retains the transport
+defect without implementing its fix.
 
 A separate product fix should bound `connection.SendDatagram` by the peer's
 `DatagramFrame.MaxDataLen` (and the path bound), returning an accurate

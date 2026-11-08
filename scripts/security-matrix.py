@@ -2,11 +2,13 @@
 """Run the SEC-MATRIX with bounded commands and inspectable per-row evidence."""
 
 import argparse
+from collections import defaultdict
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import shlex
 import shutil
@@ -21,6 +23,66 @@ SING_QUIC = "9c9fdac85d4bfbfa0336ea1c1154b384c84c259d"
 PATCH = "libs/patches/quic-go-v0.47.0-beta.2-congestion-lock.patch"
 PATCH_SHA256 = "ae512f0b0e7cf8c346f223f34ebd8846fa848b281fb50b5b7ce7b488fb29cf4c"
 PROTOCOLS = ["hysteria", "hysteria2", "tuic"]
+
+
+def verify_known_failure(transcript, exit_code):
+    """Accept only the complete, named KI-LOWDGRAM failure transcript.
+
+    Allowlist output as well as events: Go can emit a TestMain/background panic
+    after all expected leaves fail, without adding another failing test event.
+    Unknown output (including non-JSON stderr) must therefore fail closed.
+    """
+    def reject(reason):
+        raise RuntimeError(f"known-failure result changed: {reason}")
+
+    if exit_code != 1:
+        reject(f"expected exit 1, got {exit_code}")
+    parent = "TestLowDatagramRoundTrip"
+    leaves = {f"{parent}/frame=64/packet={api}/size={size}"
+              for api in ["false", "true"] for size in [255, 256, 4096]}
+    packages = {f"github.com/sagernet/sing-quic/{p}" for p in PROTOCOLS}
+    expected = {(p, t) for p in packages for t in leaves | {parent}}
+    # Each package/test must start once, fail once, and emit only its expected
+    # transcript between those events. Sets alone would hide duplicate rows.
+    states = {}
+    output = defaultdict(str)
+    for number, line in enumerate(transcript.splitlines(), 1):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            reject(f"non-JSON output at line {number}: {line!r}")
+        if not isinstance(event, dict):
+            reject(f"invalid event at line {number}")
+        package, test = event.get("Package"), event.get("Test")
+        if (not isinstance(package, str) or package not in packages or
+                ("Test" in event and (not isinstance(test, str) or (package, test) not in expected))):
+            reject(f"unexpected package/test at line {number}: {package!r}/{test!r}")
+        key = (package, test)
+        action = event.get("Action")
+        if test is not None and states.get((package, None)) != "running":
+            reject(f"test event outside running package: {key}")
+        if action == ("run" if test is not None else "start") and key not in states:
+            states[key] = "running"
+        elif action == "output" and states.get(key) == "running" and isinstance(event.get("Output"), str):
+            output[key] += event["Output"]
+        elif action == "fail" and states.get(key) == "running":
+            states[key] = "failed"
+        else:
+            reject(f"unexpected {action!r} event/state for {key} at line {number}")
+    all_keys = expected | {(p, None) for p in packages}
+    if set(states) != all_keys or any(s != "failed" for s in states.values()):
+        reject("missing or incomplete package/test rows")
+    duration = r"[0-9]+\.[0-9]+"
+    for package, test in all_keys:
+        if test is None:
+            pattern = rf"FAIL\nFAIL\t{re.escape(package)}\t{duration}s\n"
+        else:
+            diagnostic = (r"    low_datagram_test\.go:[0-9]+: "
+                          r"PROTOCOL_VIOLATION \(local\): DATAGRAM frame too large\n") if test in leaves else ""
+            pattern = (rf"=== RUN   {re.escape(test)}\n" + diagnostic +
+                       rf"[ \t]*--- FAIL: {re.escape(test)} \({duration}s\)\n")
+        if not re.fullmatch(pattern, output[(package, test)]):
+            reject(f"unexpected output for {package}/{test}: {output[(package, test)]!r}")
 
 
 def main():
@@ -120,27 +182,20 @@ def main():
             # race report, timeout, or an unrelated failing test.
             if not known:
                 raise
-        events = []
-        for line in (out / filename).read_text().splitlines():
-            try:
-                events.append(json.loads(line))
-            except ValueError:
-                pass
-        failed = {(e["Package"].rsplit("/", 1)[-1], e["Test"]) for e in events
-                  if e.get("Action") == "fail" and "/size=" in e.get("Test", "")}
+        transcript = (out / filename).read_text()
         if known:
-            expected = {(p, f"TestLowDatagramRoundTrip/frame=64/packet={api}/size={size}")
-                        for p in PROTOCOLS for api in ["false", "true"] for size in [255, 256, 4096]}
-            bad = [e for e in events if e.get("Action") == "fail" and "Test" in e
-                   and (e["Package"].rsplit("/", 1)[-1], e["Test"]) not in expected
-                   and e["Test"] != "TestLowDatagramRoundTrip"]
-            diagnostic_tests = {(e["Package"].rsplit("/", 1)[-1], e.get("Test")) for e in events
-                                if "DATAGRAM frame too large" in e.get("Output", "")}
-            if (failed != expected or bad or not expected.issubset(diagnostic_tests) or
-                    metadata["commands"][-1]["exit"] != 1):
-                raise RuntimeError(f"known-failure result changed: inspect {filename}")
+            try:
+                verify_known_failure(transcript, metadata["commands"][-1]["exit"])
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}; inspect {filename}") from error
             row["result"] = "XFAIL (18 reproduced; opt-in exits 1)"
         else:
+            events = []
+            for line in transcript.splitlines():
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    pass
             if not any(e.get("Action") == "pass" and "Test" not in e for e in events):
                 raise RuntimeError(f"no package pass events in {filename}")
             for e in events:
@@ -153,6 +208,9 @@ def main():
         print(f"{row['name']}: {row['result']}; skips={len(row['skips'])}", flush=True)
 
     try:
+        command([sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts",
+                 "-p", "test_security_matrix.py", "-v"], "verifier-self-tests.log",
+                command_env=dict(env, SEC_MATRIX_GO=go))
         version = command([go, "version"], "go-version.log").strip()
         if " go1.22.12 " not in version:
             raise RuntimeError(f"required Go 1.22.12, got {version}")
