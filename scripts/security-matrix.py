@@ -25,7 +25,7 @@ PATCH_SHA256 = "ae512f0b0e7cf8c346f223f34ebd8846fa848b281fb50b5b7ce7b488fb29cf4c
 PROTOCOLS = ["hysteria", "hysteria2", "tuic"]
 
 
-def verify_known_failure(transcript, exit_code):
+def verify_known_failure(transcript, binary_exits):
     """Accept only the complete, named KI-LOWDGRAM failure transcript.
 
     Allowlist output as well as events: Go can emit a TestMain/background panic
@@ -35,12 +35,15 @@ def verify_known_failure(transcript, exit_code):
     def reject(reason):
         raise RuntimeError(f"known-failure result changed: {reason}")
 
-    if exit_code != 1:
-        reject(f"expected exit 1, got {exit_code}")
     parent = "TestLowDatagramRoundTrip"
     leaves = {f"{parent}/frame=64/packet={api}/size={size}"
               for api in ["false", "true"] for size in [255, 256, 4096]}
     packages = {f"github.com/sagernet/sing-quic/{p}" for p in PROTOCOLS}
+    # These are Popen.wait() results from the binaries themselves, never the
+    # normalized status of go test or test2json. Require all three sources.
+    if (not isinstance(binary_exits, dict) or set(binary_exits) != packages or
+            any(type(code) is not int or code != 1 for code in binary_exits.values())):
+        reject(f"expected each test binary to exit 1, got {binary_exits!r}")
     expected = {(p, t) for p in packages for t in leaves | {parent}}
     # Each package/test must start once, fail once, and emit only its expected
     # transcript between those events. Sets alone would hide duplicate rows.
@@ -48,7 +51,14 @@ def verify_known_failure(transcript, exit_code):
     output = defaultdict(str)
     for number, line in enumerate(transcript.splitlines(), 1):
         try:
-            event = json.loads(line)
+            def unique_fields(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        reject(f"duplicate JSON field {key!r} at line {number}")
+                    result[key] = value
+                return result
+            event = json.loads(line, object_pairs_hook=unique_fields)
         except ValueError:
             reject(f"non-JSON output at line {number}: {line!r}")
         if not isinstance(event, dict):
@@ -59,8 +69,19 @@ def verify_known_failure(transcript, exit_code):
             reject(f"unexpected package/test at line {number}: {package!r}/{test!r}")
         key = (package, test)
         action = event.get("Action")
+        allowed = {"Action", "Package", "Test", "Time", "Elapsed"}
+        if action == "output":
+            allowed.add("Output")
+        if set(event) - allowed:
+            reject(f"unexpected event fields at line {number}")
         if test is not None and states.get((package, None)) != "running":
             reject(f"test event outside running package: {key}")
+        if test in leaves and states.get((package, parent)) != "running":
+            reject(f"leaf event outside running parent: {key}")
+        if action == "fail" and test in {None, parent}:
+            children = leaves if test == parent else leaves | {parent}
+            if any(states.get((package, child)) != "failed" for child in children):
+                reject(f"parent/package failed before its children: {key}")
         if action == ("run" if test is not None else "start") and key not in states:
             states[key] = "running"
         elif action == "output" and states.get(key) == "running" and isinstance(event.get("Output"), str):
@@ -75,7 +96,7 @@ def verify_known_failure(transcript, exit_code):
     duration = r"[0-9]+\.[0-9]+"
     for package, test in all_keys:
         if test is None:
-            pattern = rf"FAIL\nFAIL\t{re.escape(package)}\t{duration}s\n"
+            pattern = r"FAIL\n"
         else:
             diagnostic = (r"    low_datagram_test\.go:[0-9]+: "
                           r"PROTOCOL_VIOLATION \(local\): DATAGRAM frame too large\n") if test in leaves else ""
@@ -83,6 +104,112 @@ def verify_known_failure(transcript, exit_code):
                        rf"[ \t]*--- FAIL: {re.escape(test)} \({duration}s\)\n")
         if not re.fullmatch(pattern, output[(package, test)]):
             reject(f"unexpected output for {package}/{test}: {output[(package, test)]!r}")
+
+
+LOW_DATAGRAM_SELECTION = "^TestLowDatagramRoundTrip/frame=64/packet=.*/size=(255|256|4096)$"
+
+
+def capture_command(cmd, log, cwd, env, records, timeout=300, stdin=None):
+    """Capture an owned process directly; record its real status and deadline."""
+    cmd = [str(x) for x in cmd]
+    record = {"command": cmd, "cwd": str(cwd), "timeout_seconds": timeout,
+              "log": str(log), "stdin": str(stdin) if stdin else None,
+              "environment": {k: env.get(k) for k in
+                              ["GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED", "NKR_TEST_LOWDGRAM"]}}
+    records.append(record)
+    start = time.monotonic()
+    with log.open("wb") as stream:
+        source = stdin.open("rb") if stdin else subprocess.DEVNULL
+        try:
+            process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=source, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                record["exit"] = process.wait(timeout=timeout)
+                record["timed_out"] = False
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                record["exit"] = process.returncode
+                record["timed_out"] = True
+        finally:
+            if stdin:
+                source.close()
+    record["seconds"] = round(time.monotonic() - start, 3)
+    return record
+
+
+def require_success(record):
+    if record["exit"] != 0 or record["timed_out"]:
+        raise RuntimeError(f"command exit {record['exit']} (timeout={record['timed_out']}): "
+                           f"{shlex.join(record['command'])}; see {record['log']}")
+
+
+def verify_conversion(raw, transcript):
+    """Ensure the converter discarded no diagnostics or undecodable bytes.
+
+    Go's test2json framing removes line-leading ^V markers and NAME controls;
+    only NAME controls for this selection (or its empty reset) are allowed.
+    Every other byte must survive in the JSON Output events in source order.
+    """
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        events = [json.loads(line) for line in transcript.splitlines()]
+        decoded = "".join(e.get("Output", "") for e in events)
+    except (UnicodeError, ValueError, AttributeError, TypeError) as error:
+        raise RuntimeError("invalid test output/converter transcript") from error
+    name = (r"=== NAME  (?:TestLowDatagramRoundTrip"
+            r"(?:/frame=64/packet=(?:false|true)/size=(?:255|256|4096))?)?\n")
+    expected = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("\x16"):
+            line = line[1:]
+        if re.fullmatch(name, line):
+            continue
+        expected.append(line)
+    if "".join(expected) != decoded:
+        raise RuntimeError("raw test output and JSON output disagree")
+
+
+def run_known_failure(go, root, out, prefix, mod, env, records, timeout=300,
+                      binary_timeout=300, test_timeout="180s"):
+    """Build, directly execute, then decode each binary's captured output.
+
+    test2json only reads a completed raw log from stdin: it never owns a test
+    process and cannot normalize its status. The verdict requires the captured
+    OS statuses AND the exact decoded lifecycle/output to agree. No shell/pipe.
+    """
+    exits = {}
+    transcripts = []
+    linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
+    for protocol in PROTOCOLS:
+        stem = f"{prefix}-{protocol}"
+        binary = out / f"{stem}.test"
+        build_log = out / f"{stem}-build.log"
+        build = capture_command([go, "test", "-c", *mod, *linker, "-o", binary, f"./{protocol}"],
+                                build_log, root, env, records, timeout)
+        require_success(build)
+        if build_log.read_bytes():
+            raise RuntimeError(f"unexpected build output; see {build_log}")
+        raw = out / f"{stem}-binary.log"
+        run = capture_command([binary, "-test.v=test2json", "-test.count=1",
+                               f"-test.timeout={test_timeout}", f"-test.run={LOW_DATAGRAM_SELECTION}"],
+                              raw, root, env, records, binary_timeout)
+        if run["timed_out"]:
+            raise RuntimeError(f"test binary timed out; see {raw}")
+        package = f"github.com/sagernet/sing-quic/{protocol}"
+        exits[package] = run["exit"]
+        converted = out / f"{stem}.jsonl"
+        conversion = capture_command([go, "tool", "test2json", "-p", package],
+                                     converted, root, env, records, timeout, stdin=raw)
+        require_success(conversion)
+        decoded = converted.read_text()
+        verify_conversion(raw.read_bytes(), decoded)
+        transcripts.append(decoded)
+    transcript = "".join(transcripts)
+    (out / f"{prefix}.jsonl").write_text(transcript)
+    (out / f"{prefix}-binary-exits.json").write_text(json.dumps(exits, indent=2) + "\n")
+    verify_known_failure(transcript, exits)
+    return exits
 
 
 def main():
@@ -105,26 +232,8 @@ def main():
     metadata = {"platform": platform.platform(), "commands": [], "rows": rows}
 
     def command(cmd, log, cwd=root, command_env=env, timeout=300):
-        cmd = [str(x) for x in cmd]
-        record = {"command": cmd, "cwd": str(cwd), "timeout_seconds": timeout,
-                  "environment": {k: command_env.get(k) for k in
-                                  ["GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED", "NKR_TEST_LOWDGRAM"]}}
-        metadata["commands"].append(record)
-        start = time.monotonic()
-        with (out / log).open("wb") as stream:
-            try:
-                # Linux/macOS: terminate the whole compiler/test process group
-                # on timeout, then synchronously reap the command.
-                process = subprocess.Popen(cmd, cwd=cwd, env=command_env, stdout=stream,
-                                           stderr=subprocess.STDOUT, start_new_session=True)
-                record["exit"] = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                record["exit"] = 124
-        record["seconds"] = round(time.monotonic() - start, 3)
-        if record["exit"]:
-            raise RuntimeError(f"command exit {record['exit']}: {shlex.join(cmd)}; see {out / log}")
+        record = capture_command(cmd, out / log, cwd, command_env, metadata["commands"], timeout)
+        require_success(record)
         return (out / log).read_text()
 
     def fetch(name, url, sha):
@@ -170,26 +279,17 @@ def main():
         rows.append(row)
         filename = f"{dependency}-{name}.jsonl"
         test_env = dict(env, NKR_TEST_LOWDGRAM="1") if known else env
-        # macOS 27 rejects Go 1.22 internal-linked binaries without LC_UUID.
-        linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
-        cmd = [go, "test", *mod, *linker, "-json", "-count=1", "-timeout=180s", *flags, *packages]
-        row["command"] = cmd
         row["evidence"] = filename
-        try:
-            command(cmd, filename, command_env=test_env)
-        except RuntimeError:
-            # Opt-in checks expect actual test failures, never a build failure,
-            # race report, timeout, or an unrelated failing test.
-            if not known:
-                raise
-        transcript = (out / filename).read_text()
         if known:
-            try:
-                verify_known_failure(transcript, metadata["commands"][-1]["exit"])
-            except RuntimeError as error:
-                raise RuntimeError(f"{error}; inspect {filename}") from error
-            row["result"] = "XFAIL (18 reproduced; opt-in exits 1)"
+            row["binary_exits"] = run_known_failure(
+                go, root, out, f"{dependency}-{name}", mod, test_env, metadata["commands"])
+            row["result"] = "XFAIL (18 reproduced; each binary exits 1)"
         else:
+            # macOS 27 rejects Go 1.22 internal-linked binaries without LC_UUID.
+            linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
+            cmd = [go, "test", *mod, *linker, "-json", "-count=1", "-timeout=180s", *flags, *packages]
+            row["command"] = cmd
+            transcript = command(cmd, filename, command_env=test_env)
             events = []
             for line in transcript.splitlines():
                 try:
@@ -231,7 +331,7 @@ def main():
                       "^(TestFragmentBounds|TestWaitReadPacket|TestLowDatagram)"],
                      [f"./{p}" for p in PROTOCOLS])
             test_row(dependency, "known-low-datagram", mod,
-                     ["-run", "^TestLowDatagramRoundTrip/frame=64/packet=.*/size=(255|256|4096)$"],
+                     ["-run", LOW_DATAGRAM_SELECTION],
                      [f"./{p}" for p in PROTOCOLS], known=True)
     except (RuntimeError, OSError) as error:
         metadata["error"] = str(error)

@@ -4,10 +4,8 @@ import copy
 import importlib.util
 import json
 import os
-from pathlib import Path
-import signal
-import subprocess
 import sys
+from pathlib import Path
 import tempfile
 import unittest
 
@@ -18,6 +16,7 @@ SPEC.loader.exec_module(MATRIX)
 PARENT = "TestLowDatagramRoundTrip"
 PACKAGE = "github.com/sagernet/sing-quic/hysteria"
 LEAF = f"{PARENT}/frame=64/packet=false/size=255"
+EXITS = {f"github.com/sagernet/sing-quic/{p}": 1 for p in MATRIX.PROTOCOLS}
 SIGNATURE = "PROTOCOL_VIOLATION (local): DATAGRAM frame too large"
 
 
@@ -48,7 +47,6 @@ def fixture():
         event("output", package, PARENT, f"--- FAIL: {PARENT} (0.10s)\n")
         event("fail", package, PARENT)
         event("output", package, output="FAIL\n")
-        event("output", package, output=f"FAIL\t{package}\t0.101s\n")
         event("fail", package)
     return events
 
@@ -59,19 +57,19 @@ def transcript(events):
 
 class KnownFailureVerifierTests(unittest.TestCase):
     def test_exact_failures_accepted(self):
-        MATRIX.verify_known_failure(transcript(fixture()), 1)
+        MATRIX.verify_known_failure(transcript(fixture()), EXITS)
 
     def test_other_exit_codes_rejected(self):
         for code in [0, 2, 124, -9]:
             with self.subTest(exit_code=code), self.assertRaises(RuntimeError):
-                MATRIX.verify_known_failure(transcript(fixture()), code)
+                MATRIX.verify_known_failure(transcript(fixture()), dict(EXITS, **{PACKAGE: code}))
 
     def test_empty_or_non_json_rejected(self):
         for raw in ["", "\n", "null\n", "[]\n", "{}\n", "{broken\n",
                     transcript(fixture()) + "panic: process failure\n",
                     "# build error\n" + transcript(fixture())]:
             with self.subTest(raw=raw[-100:]), self.assertRaises(RuntimeError):
-                MATRIX.verify_known_failure(raw, 1)
+                MATRIX.verify_known_failure(raw, EXITS)
 
     def test_changed_leaf_error_rejected(self):
         for error in ["DATAGRAM frame too large",  # DatagramTooLargeError is distinct.
@@ -84,7 +82,7 @@ class KnownFailureVerifierTests(unittest.TestCase):
             target = next(e for e in events if SIGNATURE in e.get("Output", ""))
             target["Output"] = f"    low_datagram_test.go:73: {error}\n"
             with self.subTest(error=error), self.assertRaises(RuntimeError):
-                MATRIX.verify_known_failure(transcript(events), 1)
+                MATRIX.verify_known_failure(transcript(events), EXITS)
 
     def test_additional_diagnostics_rejected_at_every_scope(self):
         for diagnostic in ["panic: unrelated post-test process panic\n",
@@ -101,7 +99,7 @@ class KnownFailureVerifierTests(unittest.TestCase):
                     extra["Test"] = test
                 events.insert(position, extra)
                 with self.subTest(diagnostic=diagnostic, scope=test), self.assertRaises(RuntimeError):
-                    MATRIX.verify_known_failure(transcript(events), 1)
+                    MATRIX.verify_known_failure(transcript(events), EXITS)
 
     def test_missing_extra_duplicate_or_passed_rows_rejected(self):
         for name in ["missing-leaf", "extra-leaf", "duplicate-leaf", "passed-leaf", "skipped-leaf",
@@ -138,69 +136,213 @@ class KnownFailureVerifierTests(unittest.TestCase):
                 for e in events:
                     e["Package"] = e["Package"].replace("github.com/sagernet", "example.org/other")
             with self.subTest(outcome=name), self.assertRaises(RuntimeError):
-                MATRIX.verify_known_failure(transcript(events), 1)
+                MATRIX.verify_known_failure(transcript(events), EXITS)
 
     def test_signature_must_belong_to_the_named_row(self):
         events = fixture()
         diagnostic = next(e for e in events if SIGNATURE in e.get("Output", ""))
         diagnostic.pop("Test")
         with self.assertRaises(RuntimeError):
-            MATRIX.verify_known_failure(transcript(events), 1)
+            MATRIX.verify_known_failure(transcript(events), EXITS)
 
-    def test_real_go_testmain_panic_after_expected_failures(self):
-        # Reproduce the review's process-level failure using an isolated stdlib
-        # module, never injecting a panic into the actual protocol packages.
-        source = '''package probe
-import ("fmt"; "os"; "testing")
+    def test_missing_extra_or_invalid_binary_status_rejected(self):
+        for exits in [1, {}, {PACKAGE: 1}, dict(EXITS, extra=1),
+                      dict(EXITS, **{PACKAGE: True}), dict(EXITS, **{PACKAGE: "1"}),
+                      dict(EXITS, **{PACKAGE: None})]:
+            with self.subTest(exits=exits), self.assertRaises(RuntimeError):
+                MATRIX.verify_known_failure(transcript(fixture()), exits)
+
+    def test_converter_cannot_discard_or_add_output(self):
+        raw = b"\x16=== NAME  TestLowDatagramRoundTrip\n\x16FAIL\n"
+        decoded = transcript([{"Action": "output", "Output": "FAIL\n"}])
+        MATRIX.verify_conversion(raw, decoded)
+        for bad_raw, bad_json in [(raw + b"cleanup error\n", decoded),
+                                  (raw + b"\xff\n", decoded),
+                                  (raw + b"\x16=== NAME  unrelated error\n", decoded),
+                                  (b"", decoded), (raw, ""), (raw, "not JSON")]:
+            with self.subTest(raw=bad_raw, json=bad_json), self.assertRaises(RuntimeError):
+                MATRIX.verify_conversion(bad_raw, bad_json)
+
+    def test_valid_interleaving_and_output_chunks_accepted(self):
+        by_package = [[e for e in fixture() if e["Package"] == p] for p in EXITS]
+        events = [e for group in zip(*by_package) for e in group]
+        split = []
+        for event in events:
+            if event["Action"] == "output":
+                split.extend(dict(event, Output=c) for c in event["Output"])
+            else:
+                split.append(event)
+        MATRIX.verify_known_failure(transcript(split), EXITS)
+
+    def test_corrupt_events_and_lifecycle_rejected(self):
+        for corruption in ["unknown-action", "unknown-field", "hidden-output", "late-output",
+                           "early-parent", "early-package", "duplicate-diagnostic"]:
+            events = fixture()
+            leaf_run = next(e for e in events if e["Action"] == "run" and e.get("Test") == LEAF)
+            if corruption == "unknown-action":
+                leaf_run["Action"] = "pause"
+            elif corruption == "unknown-field":
+                leaf_run["Error"] = "hidden error"
+            elif corruption == "hidden-output":
+                leaf_run["Output"] = "panic: hidden error"
+            elif corruption == "late-output":
+                events.append({"Action": "output", "Package": PACKAGE, "Output": "error"})
+            elif corruption in ["early-parent", "early-package"]:
+                test = PARENT if corruption == "early-parent" else None
+                terminal = next(e for e in events if e["Action"] == "fail" and e.get("Test") == test)
+                events.remove(terminal)
+                events.insert(3, terminal)
+            else:
+                diagnostic = next(e for e in events if SIGNATURE in e.get("Output", ""))
+                events.insert(events.index(diagnostic), copy.deepcopy(diagnostic))
+            with self.subTest(corruption=corruption), self.assertRaises(RuntimeError):
+                MATRIX.verify_known_failure(transcript(events), EXITS)
+        raw = transcript(fixture()).replace('"Action": "start"', '"Action": "pass", "Action": "start"', 1)
+        with self.assertRaisesRegex(RuntimeError, "duplicate JSON field"):
+            MATRIX.verify_known_failure(raw, EXITS)
+
+
+PROBE_SOURCE = '''package probe
+import ("fmt"; "os"; "testing"; "time"; "syscall")
 func TestLowDatagramRoundTrip(t *testing.T) {
+    if os.Getenv("SEC_MATRIX_PROBE") == "no-tests" { return }
     for _, api := range []bool{false, true} {
         for _, size := range []int{255, 256, 4096} {
             t.Run(fmt.Sprintf("frame=64/packet=%t/size=%d", api, size), func(t *testing.T) {
-                t.Fatal("PROTOCOL_VIOLATION (local): DATAGRAM frame too large")
+                t.Error("PROTOCOL_VIOLATION (local): DATAGRAM frame too large")
+                if os.Getenv("SEC_MATRIX_PROBE") == "timeout" { time.Sleep(time.Hour) }
             })
         }
     }
 }
 func TestMain(m *testing.M) {
+    mode := os.Getenv("SEC_MATRIX_PROBE")
+    if mode == "skip-all" { os.Exit(0) }
     code := m.Run()
-    if os.Getenv("SEC_MATRIX_PROBE_PANIC") == "1" { panic("unrelated post-test process panic") }
+    switch mode {
+    case "trailing-output": fmt.Fprintln(os.Stderr, "unrelated cleanup error")
+    case "exit2": os.Exit(2)
+    case "exit0": os.Exit(0)
+    case "panic": panic("unrelated post-test process panic")
+    case "goroutine-panic":
+        go func() { panic("unrelated background panic") }()
+        time.Sleep(time.Hour)
+    case "hang": time.Sleep(time.Hour)
+    case "signal": syscall.Kill(os.Getpid(), syscall.SIGKILL)
+    }
     os.Exit(code)
 }
 '''
-        with tempfile.TemporaryDirectory(prefix=".verifier-probe-", dir=Path(__file__).parent) as directory:
-            root = Path(directory)
-            (root / "go.mod").write_text("module github.com/sagernet/sing-quic\n\ngo 1.22\n")
-            for protocol in ["hysteria", "hysteria2", "tuic"]:
-                (root / protocol).mkdir()
-                (root / protocol / "low_datagram_test.go").write_text(source)
-            env = dict(os.environ, GOTOOLCHAIN="local", GOWORK="off", GOFLAGS="-mod=readonly")
-            for panic in [False, True]:
-                env["SEC_MATRIX_PROBE_PANIC"] = "1" if panic else "0"
-                cmd = [env.get("SEC_MATRIX_GO", "go"), "test", "-json", "-count=1", "-timeout=20s"]
-                if sys.platform == "darwin":
-                    cmd += ["-ldflags=-linkmode=external"]
-                with tempfile.TemporaryFile() as log:
-                    process = subprocess.Popen(cmd + ["./..."], cwd=root, env=env, stdout=log,
-                                               stderr=subprocess.STDOUT, start_new_session=True)
-                    try:
-                        process.wait(timeout=60)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                        self.fail("Go verifier probe exceeded 60 seconds")
-                    log.seek(0)
-                    raw = log.read().decode()
-                self.assertEqual(process.returncode, 1, raw)
-                if panic:
-                    self.assertIn("panic: unrelated post-test process panic", raw)
-                    # All 18 expected leaf failures still occurred before panic.
-                    leaves = [e for e in map(json.loads, raw.splitlines())
-                              if e.get("Action") == "fail" and "/size=" in e.get("Test", "")]
-                    self.assertEqual(len(leaves), 18)
-                    with self.assertRaisesRegex(RuntimeError, "unexpected output"):
-                        MATRIX.verify_known_failure(raw, process.returncode)
-                else:
-                    MATRIX.verify_known_failure(raw, process.returncode)
+
+
+class RealProcessVerifierTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # An isolated stdlib-only module: never mutate real protocol tests.
+        cls.temp = tempfile.TemporaryDirectory(prefix=".verifier-probe-", dir=Path(__file__).parent)
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name).resolve()
+        (cls.root / "go.mod").write_text("module github.com/sagernet/sing-quic\n\ngo 1.22\n")
+        for protocol in MATRIX.PROTOCOLS:
+            (cls.root / protocol).mkdir()
+            (cls.root / protocol / "low_datagram_test.go").write_text(PROBE_SOURCE)
+        cls.go = os.environ.get("SEC_MATRIX_GO", "go")
+        cls.env = dict(os.environ, GOTOOLCHAIN="local", GOWORK="off", GOFLAGS="-mod=readonly",
+                       NKR_TEST_LOWDGRAM="1", CGO_ENABLED="1")
+
+    def probe(self, mode, rejection=None, go=None):
+        out = self.root / mode
+        out.mkdir()
+        records = []
+        env = dict(self.env, SEC_MATRIX_PROBE=mode)
+        try:
+            if rejection:
+                with self.assertRaisesRegex(RuntimeError, rejection):
+                    MATRIX.run_known_failure(go or self.go, self.root, out, "probe", [], env, records,
+                                             binary_timeout=2, test_timeout="1s")
+            else:
+                exits = MATRIX.run_known_failure(go or self.go, self.root, out, "probe", [], env, records,
+                                                 binary_timeout=2, test_timeout="1s")
+                self.assertEqual(exits, EXITS)
+        finally:
+            summary = [{"command": r["command"], "exit": r.get("exit"),
+                        "timed_out": r.get("timed_out")} for r in records]
+            print(f"real probe {mode}: " + json.dumps(summary), flush=True)
+        return out, records
+
+    def test_real_expected_failure_control(self):
+        self.probe("control")
+
+    def test_real_post_test_exit2_hidden_by_go_test(self):
+        out, records = self.probe("exit2", "each test binary to exit 1")
+        binary_runs = [r for r in records if r["command"][0].endswith(".test")]
+        self.assertEqual([r["exit"] for r in binary_runs], [2, 2, 2])
+        events = list(map(json.loads, (out / "probe.jsonl").read_text().splitlines()))
+        self.assertEqual(sum(e["Action"] == "fail" and "/size=" in e.get("Test", "") for e in events), 18)
+        # Reproduce Go's normalization independently: the same binaries' tests
+        # report outer exit 1, with all 18 leaves failed and no exit-status text.
+        cmd = [self.go, "test", "-json", "-count=1", "-timeout=2s"]
+        if MATRIX.sys.platform == "darwin":
+            cmd += ["-ldflags=-linkmode=external"]
+        log = out / "go-test-normalized.jsonl"
+        record = MATRIX.capture_command(cmd + ["./..."], log, self.root,
+                                        dict(self.env, SEC_MATRIX_PROBE="exit2"), records, 60)
+        self.assertEqual(record["exit"], 1)
+        self.assertFalse(record["timed_out"])
+        self.assertNotIn("exit status 2", log.read_text())
+        outer_events = list(map(json.loads, log.read_text().splitlines()))
+        self.assertEqual(sum(e["Action"] == "fail" and "/size=" in e.get("Test", "") for e in outer_events), 18)
+
+    def test_real_post_test_exit0_inconsistent_with_failures(self):
+        self.probe("exit0", "each test binary to exit 1")
+
+    def test_real_go_testmain_panic_after_expected_failures(self):
+        out, _ = self.probe("panic", "each test binary to exit 1|unexpected output")
+        raw = (out / "probe-hysteria-binary.log").read_text()
+        self.assertIn("panic: unrelated post-test process panic", raw)
+        self.assertEqual(raw.count("PROTOCOL_VIOLATION (local): DATAGRAM frame too large"), 6)
+
+    def test_real_background_panic_after_expected_failures(self):
+        self.probe("goroutine-panic", "each test binary to exit 1|unexpected output")
+
+    def test_real_hang_after_expected_failures(self):
+        self.probe("hang", "test binary timed out")
+
+    def test_real_go_test_timeout(self):
+        self.probe("timeout", "each test binary to exit 1|unexpected")
+
+    def test_real_diagnostic_after_expected_failures_with_exit1(self):
+        self.probe("trailing-output", "unexpected output")
+
+    def test_real_signal_after_expected_failures(self):
+        self.probe("signal", "each test binary to exit 1")
+
+    def test_real_skip_all_testmain(self):
+        self.probe("skip-all", "each test binary to exit 1")
+
+    def test_real_no_selected_leaves(self):
+        self.probe("no-tests", "each test binary to exit 1")
+
+    def test_real_converter_failure_or_missing_output(self):
+        real_go = MATRIX.shutil.which(self.go)
+        for mode, body, rejection in [
+                ("converter-error", 'print("converter failed"); sys.exit(2)', "command exit"),
+                ("converter-empty", 'sys.exit(0)', "raw test output and JSON output disagree")]:
+            wrapper = self.root / mode
+            wrapper.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                               f"if sys.argv[1:3] == ['tool', 'test2json']:\n    {body}\n"
+                               f"os.execv({real_go!r}, [{real_go!r}] + sys.argv[1:])\n")
+            wrapper.chmod(0o700)
+            # Use another name for the output directory.
+            self.probe(mode + "-probe", rejection, go=str(wrapper))
+
+    def test_real_build_failure(self):
+        path = self.root / "hysteria" / "broken_test.go"
+        path.write_text("package probe\nthis does not compile\n")
+        try:
+            self.probe("build-failure", "command exit")
+        finally:
+            path.unlink()
 
 
 if __name__ == "__main__":

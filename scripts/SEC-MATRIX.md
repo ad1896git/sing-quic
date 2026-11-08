@@ -29,10 +29,15 @@ SEC_MATRIX_GO=/path/to/go1.22.12 python3 -B -m unittest discover \
   -s scripts -p test_security_matrix.py -v
 ```
 
-The self-tests reject panics (including an actual post-test `TestMain` panic),
-fatal/race/build diagnostics, timeouts, a different error cause, vacuous passes,
-missing/extra/duplicate rows, and non-JSON output. The process probe creates a
-temporary standard-library-only Go module and removes it after the check.
+The self-tests reject panics (including actual post-test `TestMain` and
+background panics), silent post-test exits 0/2, signals, hangs, Go timeouts,
+build/converter failures, lost converter output, fatal/race diagnostics,
+a different error cause, vacuous passes, missing/extra/duplicate rows, invalid
+lifecycles, and malformed/non-JSON output. They also reproduce Go's silent
+normalization of a binary's exit 2 into outer exit 1, then require rejection by
+the same direct-binary path used in the matrix. Process probes create a temporary
+standard-library-only Go module and remove it after the checks. Positive controls
+require the exact failures and accept valid interleaving/output chunking.
 
 The standalone set uses this module's unchanged `go.mod`/`go.sum`: sing 0.4.1,
 quic-go 0.46.0-beta.4. The shipped overlay uses nekoray
@@ -73,16 +78,35 @@ NKR_TEST_LOWDGRAM=1 go test -count=1 -timeout=180s \
 
 This command **exits 1** with `PROTOCOL_VIOLATION (local): DATAGRAM frame too
 large` for each case. Add `-modfile` for the generated shipped overlay, or the
-external-link flag on macOS. The runner executes this opt-in command for each
-dependency set and only records XFAIL if exactly these 18 leaf tests fail with
-that exact diagnostic, attributed to each named row, and the command exits 1.
-It validates the complete package/test lifecycle and allowlists all output:
-only the Go test run/failure framing, one exact transport diagnostic per leaf,
-and the three failing package summaries are accepted. Package-level or raw
-stderr diagnostics also fail verification, even after all 18 expected failures.
-A timeout, panic, fatal error, race, build failure, changed error, pass, skip,
-missing/extra/duplicate row, or any other output fails the matrix loudly.
-Normal rows retain the explicit skips in their logs.
+external-link flag on macOS.
+
+For each dependency set, the runner instead builds each selected package with
+`go test -c` and directly executes its fresh binary with
+`-test.v=test2json -test.count=1 -test.timeout=180s -test.run=<selection>`.
+It owns each process and records its actual OS exit status using `Popen.wait`.
+This avoids `go test`'s normalization of silent binary exit 2 into outer exit 1.
+Each build must exit 0 without diagnostics; **each binary itself must exit 1**,
+without hitting the outer 300-second deadline. A timeout kills/reaps the process
+group and fails regardless of the transcript.
+
+Only after a binary exits, `go tool test2json -p <package>` reads its completed
+raw log from stdin; the converter never runs the binary. Conversion must exit 0.
+All raw UTF-8 output must survive in the JSON Output events, except Go's known
+line-leading marker and selected-test NAME controls. Lost/added diagnostics,
+invalid bytes, unknown NAME controls, or any disagreement fail verification.
+The raw logs, decoded JSONL, actual binary exits, exact commands and deadlines
+are preserved in the CI artifacts.
+
+XFAIL requires agreement between those direct statuses and the entire decoded
+outcome: exactly the 18 named failing leaves with one exact transport diagnostic
+each, three failing parents, and three final package failures. The verifier
+allowlists the complete lifecycle and output, including the binary's final
+`FAIL` line; it rejects unknown JSON fields/actions and duplicate JSON keys.
+An exit 1 alone or a matching diagnostic alone never establishes XFAIL.
+Package-level/raw stderr diagnostics fail even after all expected failures.
+A panic, fatal error, race, build/converter failure, timeout, changed error,
+pass, skip, missing/extra/duplicate row, truncated/invalid lifecycle, unexpected
+status, or other output fails the matrix. Normal rows retain the explicit skips.
 
 ## DEFECT: KI-LOWDGRAM (P2, shipped affected)
 
