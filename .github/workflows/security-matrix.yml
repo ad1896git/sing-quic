@@ -1,0 +1,49 @@
+name: Security matrix
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: off
+  GOFLAGS: -mod=readonly
+  CGO_ENABLED: '1'
+
+jobs:
+  matrix:
+    name: Linux SEC-MATRIX (${{ matrix.dependencies }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        dependencies: [standalone, shipped]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.22.12'
+      - name: Test tags, race, boundaries, and explicit known failures
+        run: python3 scripts/security-matrix.py --dependencies '${{ matrix.dependencies }}' --output '${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}'
+      - name: Preserve commands, results, and skip reasons
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sec-matrix-${{ matrix.dependencies }}
+          path: |
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/*.log
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/*.jsonl
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/*.json
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/*.md
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/shipped.mod
+            ${{ runner.temp }}/sec-matrix-${{ matrix.dependencies }}/shipped.sum
+          if-no-files-found: error
