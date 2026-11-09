@@ -453,6 +453,7 @@
       "TestAuthTimeout/timeout_wins_during_token_validation",
       "TestClientConnectionConcurrencyCloseDuringCreation",
       "TestClientConnectionConcurrencyRequests",
+      "TestConcurrentUDPMTU",
       "TestDefragBudgetCloseReleases",
       "TestDefragBudgetConcurrent",
       "TestDefragBudgetIdleSessionExpires",

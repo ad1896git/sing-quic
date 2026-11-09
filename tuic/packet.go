@@ -136,7 +136,8 @@ type udpPacketConn struct {
 	quicConn        quic.Connection
 	data            chan *udpMessage
 	udpStream       bool
-	udpMTU          int
+	udpMTU          int // protected by udpMTUAccess after construction
+	udpMTUAccess    sync.Mutex
 	packetId        atomic.Uint32
 	closeOnce       sync.Once
 	isServer        bool
@@ -213,8 +214,11 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	}
 	defer message.release()
 	var err error
-	if !c.udpStream && (c.udpMTU <= message.headerSize() || buffer.Len() > c.udpMTU-message.headerSize()) {
-		err = c.writeFragmented(message, c.udpMTU)
+	c.udpMTUAccess.Lock()
+	udpMTU := c.udpMTU
+	c.udpMTUAccess.Unlock()
+	if !c.udpStream && (udpMTU <= message.headerSize() || buffer.Len() > udpMTU-message.headerSize()) {
+		err = c.writeFragmented(message, udpMTU)
 	} else {
 		err = c.writePacket(message)
 	}
@@ -252,8 +256,11 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		referenced:    true,
 	}
 	defer message.release()
-	if !c.udpStream && (c.udpMTU <= message.headerSize() || len(p) > c.udpMTU-message.headerSize()) {
-		err = c.writeFragmented(message, c.udpMTU)
+	c.udpMTUAccess.Lock()
+	udpMTU := c.udpMTU
+	c.udpMTUAccess.Unlock()
+	if !c.udpStream && (udpMTU <= message.headerSize() || len(p) > udpMTU-message.headerSize()) {
+		err = c.writeFragmented(message, udpMTU)
 		if err == nil {
 			return len(p), nil
 		}
@@ -297,7 +304,9 @@ func (c *udpPacketConn) retryFragmented(message *udpMessage, maxDatagramPayloadS
 		return errors.New("UDP payload MTU must be positive")
 	}
 	maxPacketSize := int(maxDatagramPayloadSize - 3)
+	c.udpMTUAccess.Lock()
 	c.udpMTU = maxPacketSize
+	c.udpMTUAccess.Unlock()
 	return c.writeFragmented(message, maxPacketSize)
 }
 
