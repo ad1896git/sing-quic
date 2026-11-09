@@ -45,12 +45,14 @@ shared production path rejects both.
 
 The standalone set uses this module's unchanged `go.mod`/`go.sum`: sing 0.4.1,
 quic-go 0.46.0-beta.4. The shipped overlay uses nekoray
-`1127938594e4c67352124ff6362dc704bd0faeeb`, which pins sing-quic base
-`9c9fdac85d4bfbfa0336ea1c1154b384c84c259d` and quic-go
+`218b2a142d2732b7ff09420fb5a33fcb7b5dbca9`, which pins sing-quic base
+`56e36b45e5ec061cc5629ca653c3b46fcf9c51f5` and quic-go
 `7101329b86a0c801e643fc8ccf730ec89be10663` (0.47.0-beta.2). The runner verifies
 the pins, the core's sing 0.4.3 requirement and local quic-go replace directive,
-and the congestion patch digest, then applies that exact patch to an isolated
-checkout. A temporary modfile selects these dependencies for the current tests;
+and the carried congestion/DG-FIX patch SHA-256
+`e7c92615397316d191b01fca25f44075b353b9a95310fda80dd9e5dd19e12ded`,
+then applies that exact patch to an isolated checkout. A temporary modfile
+selects these dependencies for the current tests;
 it also resolves the transitive sys/text versions selected by sing 0.4.3.
 Repository module files and the module cache are not patched. This tests the
 sing-quic dependency combination used by nekoray, not the full nekobox_core
@@ -83,7 +85,7 @@ redirect reports or make a detected race an accepted status.
 | `GOMAXPROCS` | `2`; fixed parallel runtime, including race probes |
 | Other `GO*`, including `GOOS`, `GOARCH`, `GOEXPERIMENT`, `GOPATH` | Removed except the cache/module-transport settings below; native/default Go settings apply |
 | `CGO_*`, `CC`, `CXX`, `FC`, `AR`, `PKG_CONFIG` | Removed before setting `CGO_ENABLED`; use native compiler defaults |
-| `NKR_TEST_LOWDGRAM`, `NKR_STRESS_STREAMS` | Removed at startup; only explicit XFAIL rows enable the low-datagram opt-in |
+| `NKR_TEST_LOWDGRAM`, `NKR_STRESS_STREAMS` | Removed at startup; shipped rows and the standalone XFAIL row explicitly enable the low-datagram opt-in |
 | `GOCACHE`, `GOMODCACHE` | Retained to support isolated warm or cold scratch caches |
 | `GOPROXY`, `GOSUMDB`, `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB`, `GOINSECURE`, `GOVCS` | Retained module transport/auth policy; downloads must succeed |
 
@@ -100,7 +102,7 @@ Download output has its own log; any error stops the matrix. A cold module cache
 therefore does not feed download notices into the strict package parser. The
 binary transcript grammar and package inventory checks remain unchanged.
 
-## KI-LOWDGRAM: explicit known failure
+## KI-LOWDGRAM: shipped PASS, standalone XFAIL
 
 All three protocols' `TestLowDatagramRoundTrip` negotiate a real QUIC loopback
 pair and use `udpPacketConn.WriteTo` (`packet=false`) or `WritePacket`
@@ -108,10 +110,18 @@ pair and use `udpPacketConn.WriteTo` (`packet=false`) or `WritePacket`
 case compares the original payload and destination. Frame size 0 selects the
 QUIC default, rather than advertising zero bytes. Both APIs pass sizes
 0/1/31/32/33/255/256/4096 at the default limit. With peer frame size 64, sizes
-0/1/31/32/33 pass, while 255/256/4096 fail in both dependency sets.
+0/1/31/32/33 pass in both sets. Sizes 255/256/4096 now pass with the shipped
+DG-FIX patch; they still fail with standalone quic-go 0.46.0-beta.4.
 
-The 18 failing cases default to explicit `KNOWN-FAIL/XFAIL KI-LOWDGRAM` skips,
-pending owner/orchestrator decision. Enable their unchanged assertions with:
+Outside the matrix, the 18 affected cases still default to explicit
+`KNOWN-FAIL/XFAIL KI-LOWDGRAM` skips because the repository module selects the
+unfixed standalone dependency. The runner explicitly enables their unchanged
+assertions in **every shipped row**, requiring all 96 datagram leaves to pass
+under every tag/race combination and the boundary selection. The separate
+shipped low-datagram row requires the same 18 formerly failing leaves to PASS
+with zero skips. Standalone normal rows retain the 18 skips, and its separate
+known-low-datagram row requires the exact 18 failures. Enable the cases manually
+with:
 
 ```sh
 NKR_TEST_LOWDGRAM=1 go test -count=1 -timeout=180s \
@@ -119,9 +129,10 @@ NKR_TEST_LOWDGRAM=1 go test -count=1 -timeout=180s \
   ./hysteria ./hysteria2 ./tuic
 ```
 
-This command **exits 1** with `PROTOCOL_VIOLATION (local): DATAGRAM frame too
-large` for each case. Add `-modfile` for the generated shipped overlay, or the
-external-link flag on macOS.
+With standalone dependencies this command **exits 1** with
+`PROTOCOL_VIOLATION (local): DATAGRAM frame too large` for each case. Adding
+`-modfile` for the generated shipped overlay must instead produce 18 PASS leaves
+and exit 0. Add the external-link flag on macOS.
 
 ## One outcome classifier for every row
 
@@ -147,7 +158,9 @@ normal test/subtest, the existing stress skip's exact reason, and the packages
 without tests. It was checked against every tag/race/dependency result at the
 reviewed head `4e9898ee`; it is **never regenerated from the current run**. Debug
 adds its one build-tagged test; the boundary selection filters the inventory;
-the opt-in expectation names the three parents and 18 known leaves explicitly.
+the focused low-datagram expectation names the three parents and 18 leaves
+explicitly. The inventory also pins `low_datagram_expected`: standalone XFAIL
+and shipped PASS; it never infers these from an observed result.
 Changes to test names, test coverage or allowed output require a reviewed update
 of this inventory. A bypassed `m.Run`, silently removed subtest, extra test or
 new skip cannot redefine success. Full rows also check `go list ./...` against
@@ -171,13 +184,17 @@ XFAIL additionally requires one exact `PROTOCOL_VIOLATION (local): DATAGRAM fram
 too large` at each named `low_datagram_test.go` assertion, exactly 18 failing
 leaves, three failing parents/packages, and no skips. A distinct
 `DatagramTooLargeError`, remote error, added assertion, panic, race or trailing
-diagnostic fails. Normal rows require their 78 passing datagram leaves and 18
-explicit known-failure skips, including payload/destination/receipt assertions.
+diagnostic fails. Standalone normal rows require their 78 passing datagram leaves
+and 18 explicit known-failure skips. Shipped normal/boundary rows require all 96
+leaves to PASS, and the focused row requires all 18 leaves to PASS. Any shipped
+failure, missing leaf, or skip is rejected, including the old exact XFAIL output.
+All payload/destination/receipt assertions are retained.
 An exit status or matching diagnostic alone never establishes a green row.
 
-## DEFECT: KI-LOWDGRAM (P2, shipped affected)
+## DEFECT: KI-LOWDGRAM (P2, shipped fixed by DG-FIX)
 
-Proposed severity: **P2**, shipped affected. The defect is in quic-go's shared
+Historical severity: **P2**, shipped affected before DG-FIX. The remaining
+standalone defect is in quic-go's shared
 `connection.SendDatagram` size check, which takes the maximum of the peer limit
 and path estimate. It affects both client and server sending paths. The runtime
 repro is client-to-server; server exposure follows from the common transport and
@@ -195,12 +212,19 @@ peers pass the exercised cases; this defect requires a smaller advertised bound
 from a configured peer or another implementation. The tested sizes are sample
 points, not a minimum failing size or proof that every larger payload fails.
 The review's deliberately injected process panic demonstrates a verifier gap,
-not a product crash. This PR tightens that verifier and retains the transport
-defect without implementing its fix.
+not a product crash. The shipped patch is fixed by nekoray PR #47, merged at
+`a4d6f17dab745eb20043ad8938aa65d7f7fcc40a`, and included in the pinned
+`218b2a14` baseline. Standalone remains unfixed.
 
-A separate product fix should bound `connection.SendDatagram` by the peer's
-`DatagramFrame.MaxDataLen` (and the path bound), returning an accurate
-`DatagramTooLargeError` before enqueue. The three `packet.go` implementations'
-`WriteTo`/`WritePacket` already use that error in `retryFragmented`. Limits too
-small for a header should return a clean error; ordinary low limits should
-fragment without a connection close. No product fix is included here.
+DG-FIX bounds `connection.SendDatagram` by the minimum of the peer's
+`DatagramFrame.MaxDataLen` and the path bound, returning an accurate
+`DatagramTooLargeError` before enqueue. It also checks minimum encoded-frame
+size and revalidates queued frames after transport-parameter changes, in both
+ordinary and ECH backends. The three `packet.go` implementations'
+`WriteTo`/`WritePacket` already use the typed error in `retryFragmented`, allowing
+the exercised low-limit writes to fragment without a connection close.
+
+This follow-up changes only matrix scripts, the reviewed expectation inventory,
+and this documentation. No production Go code or module manifests change.
+Nekoray needs no sing-quic re-pin to receive the fix: its carried patch already
+contains DG-FIX, and these test/CI changes do not affect the shipped executable.

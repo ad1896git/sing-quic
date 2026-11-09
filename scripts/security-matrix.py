@@ -18,11 +18,11 @@ import sys
 import time
 
 
-NEKORAY = "1127938594e4c67352124ff6362dc704bd0faeeb"
+NEKORAY = "218b2a142d2732b7ff09420fb5a33fcb7b5dbca9"
 QUIC = "7101329b86a0c801e643fc8ccf730ec89be10663"
-SING_QUIC = "9c9fdac85d4bfbfa0336ea1c1154b384c84c259d"
+SING_QUIC = "56e36b45e5ec061cc5629ca653c3b46fcf9c51f5"
 PATCH = "libs/patches/quic-go-v0.47.0-beta.2-congestion-lock.patch"
-PATCH_SHA256 = "ae512f0b0e7cf8c346f223f34ebd8846fa848b281fb50b5b7ce7b488fb29cf4c"
+PATCH_SHA256 = "e7c92615397316d191b01fca25f44075b353b9a95310fda80dd9e5dd19e12ded"
 PROTOCOLS = ["hysteria", "hysteria2", "tuic"]
 
 
@@ -68,7 +68,7 @@ def environment_record(env):
     return {key: env.get(key) for key in ENV_RECORD}
 
 
-def expected_outcomes(known=False, debug=False, boundaries=False):
+def expected_outcomes(known=False, debug=False, boundaries=False, dependency="standalone"):
     """Reviewed inventory, independent of the test execution being classified.
 
     Never learn expected tests from this run: a bypassed m.Run or removed subtest
@@ -76,6 +76,9 @@ def expected_outcomes(known=False, debug=False, boundaries=False):
     Each entry is (terminal action, exact diagnostic), including allowed skips.
     """
     manifest = json.loads(Path(__file__).with_name("security-matrix-tests.json").read_text())
+    low_datagram = manifest["low_datagram_expected"][dependency]
+    if low_datagram not in {"xfail", "pass"}:
+        raise RuntimeError("invalid low-datagram expectation")
     expected = {}
     for package, tests in manifest["tests"].items():
         if (known or boundaries) and package not in {f"{MODULE}/{p}" for p in PROTOCOLS}:
@@ -85,7 +88,7 @@ def expected_outcomes(known=False, debug=False, boundaries=False):
         if debug and not (known or boundaries) and package == f"{MODULE}/hysteria":
             selected["TestDuplicateUDPSession"] = ("pass", None)
         if known:
-            selected = {PARENT: ("fail", None)}
+            selected = {PARENT: ("fail" if low_datagram == "xfail" else "pass", None)}
         for test in list(selected):
             if test in manifest["skips"]:
                 selected[test] = ("skip", manifest["skips"][test])
@@ -93,7 +96,10 @@ def expected_outcomes(known=False, debug=False, boundaries=False):
             for api in ["false", "true"]:
                 for size in [255, 256, 4096]:
                     test = f"{PARENT}/frame=64/packet={api}/size={size}"
-                    selected[test] = ("fail", SIGNATURE) if known else ("skip", KNOWN_SKIP)
+                    if low_datagram == "pass":
+                        selected[test] = ("pass", None)
+                    else:
+                        selected[test] = ("fail", SIGNATURE) if known else ("skip", KNOWN_SKIP)
         expected[package] = selected
     return expected
 
@@ -383,9 +389,10 @@ def main():
         row = {"name": f"{dependency}/{name}", "result": "FAIL", "skips": []}
         rows.append(row)
         prefix = f"{dependency}-{name}"
-        test_env = dict(env, NKR_TEST_LOWDGRAM="1") if known else env
+        test_env = dict(env, NKR_TEST_LOWDGRAM="1") if known or dependency == "shipped" else env
         boundaries = name == "boundaries"
-        expected = expected_outcomes(known=known, debug="debug" in name, boundaries=boundaries)
+        expected = expected_outcomes(known=known, debug="debug" in name, boundaries=boundaries,
+                                     dependency=dependency)
         build_flags = [f for f in flags if f.startswith("-tags=") or f == "-race"]
         selection = LOW_DATAGRAM_SELECTION if known else BOUNDARIES if boundaries else None
         if not (known or boundaries):
@@ -405,7 +412,8 @@ def main():
         row["skips"] += [{"package": p, "test": t, "reason": diagnostic}
                          for p, tests in expected.items() for t, (action, diagnostic) in tests.items()
                          if action == "skip"]
-        row["result"] = "XFAIL (18 reproduced; each binary exits 1)" if known else "PASS"
+        xfail = any(action == "fail" for tests in expected.values() for action, _ in tests.values())
+        row["result"] = "XFAIL (18 reproduced; each binary exits 1)" if xfail else "PASS"
         print(f"{row['name']}: {row['result']}; skips={len(row['skips'])}", flush=True)
 
     try:
@@ -433,7 +441,8 @@ def main():
                     name = (tags.replace(",", "-") or "standard") + ("-race" if race else "")
                     test_row(dependency, name, mod, flags)
             test_row(dependency, "boundaries", mod, ["-race", "-tags=debug,with_low_memory"])
-            test_row(dependency, "known-low-datagram", mod, [], known=True)
+            test_row(dependency, "known-low-datagram" if dependency == "standalone" else "low-datagram",
+                     mod, [], known=True)
     except (RuntimeError, OSError) as error:
         metadata["error"] = str(error)
         print(error, file=sys.stderr)
