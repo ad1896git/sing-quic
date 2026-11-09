@@ -266,16 +266,33 @@ class SharedClassifierTests(unittest.TestCase):
                     MATRIX.verify_package_inventory(bad, wanted, no_tests)
 
     def test_manifest_pins_all_datagram_assertions(self):
-        for debug in [False, True]:
-            for boundaries in [False,True]:
-                wanted = MATRIX.expected_outcomes(debug=debug,boundaries=boundaries)
-                for protocol in MATRIX.PROTOCOLS:
-                    tests = wanted[f'{MATRIX.MODULE}/{protocol}']
-                    datagrams = {t:a for t,(a,_) in tests.items() if t.startswith(PARENT+'/')}
-                    self.assertEqual(len(datagrams),32)
-                    self.assertEqual(sum(a=='pass' for a in datagrams.values()),26)
-                    self.assertEqual(sum(a=='skip' for a in datagrams.values()),6)
-        self.assertEqual(MATRIX.expected_outcomes(known=True),expected(True))
+        for dependency in ["standalone", "shipped"]:
+            for debug in [False, True]:
+                for boundaries in [False, True]:
+                    wanted = MATRIX.expected_outcomes(debug=debug, boundaries=boundaries,
+                                                       dependency=dependency)
+                    for protocol in MATRIX.PROTOCOLS:
+                        tests = wanted[f'{MATRIX.MODULE}/{protocol}']
+                        datagrams = {t:a for t,(a,_) in tests.items() if t.startswith(PARENT+'/')}
+                        self.assertEqual(len(datagrams), 32)
+                        self.assertEqual(sum(a == 'pass' for a in datagrams.values()),
+                                         32 if dependency == 'shipped' else 26)
+                        self.assertEqual(sum(a == 'skip' for a in datagrams.values()),
+                                         0 if dependency == 'shipped' else 6)
+            self.assertEqual(MATRIX.expected_outcomes(known=True, dependency=dependency),
+                             expected(dependency == 'standalone'))
+
+    def test_shipped_inventory_rejects_old_xfail_and_missing_leaves(self):
+        wanted = MATRIX.expected_outcomes(known=True, dependency="shipped")
+        self.verify(False, wanted=wanted)
+        # Exact old XFAIL output/status can no longer satisfy the shipped row.
+        with self.assertRaises(RuntimeError):
+            self.verify(True, wanted=wanted)
+        for scope in [LEAF, PARENT]:
+            events = [e for e in fixture(False)
+                      if not (e['Package'] == PACKAGE and e.get('Test') == scope)]
+            with self.subTest(scope=scope), self.assertRaises(RuntimeError):
+                self.verify(False, events, wanted=wanted)
 
 
 class StartupTests(unittest.TestCase):
@@ -398,7 +415,10 @@ class RealProcessTests(unittest.TestCase):
             binary = out/'probe-hysteria.test'
             binary.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(out / "stale-executed")!r}).touch()\n')
             binary.chmod(0o700)
-        wanted = expected(known) if all_packages else {PACKAGE: expected(known)[PACKAGE]}
+        wanted = MATRIX.expected_outcomes(known=True,
+                                          dependency="standalone" if known else "shipped")
+        if not all_packages:
+            wanted = {PACKAGE: wanted[PACKAGE]}
         env = dict(self.env,SEC_MATRIX_EXPECTED='xfail' if known else 'pass',SEC_MATRIX_PROBE=mode)
         if hostile:
             env.update(hostile)
