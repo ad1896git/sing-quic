@@ -275,6 +275,7 @@ type serverSession[U comparable] struct {
 	authUser      U
 	password      string
 	udpAccess     sync.RWMutex
+	udpClosed     bool // guarded by udpAccess
 	udpConnMap    map[uint32]*udpPacketConn
 
 	defragBudget *defragBudget
@@ -399,6 +400,18 @@ func (s *serverSession[U]) closeWithError(err error) {
 		close(s.connDone)
 	}
 	s.connAccess.Unlock()
+	// Child Close callbacks acquire udpAccess; detach under the lock and
+	// release it before closing any child, including on user revocation.
+	s.udpAccess.Lock()
+	s.udpClosed = true
+	packets := s.udpConnMap
+	s.udpConnMap = nil
+	s.udpAccess.Unlock()
+	defer func() {
+		for _, packet := range packets {
+			_ = packet.Close()
+		}
+	}()
 	if errors.Is(err, errUserRevoked) {
 		_ = s.quicConn.CloseWithError(1, "user revoked")
 		return

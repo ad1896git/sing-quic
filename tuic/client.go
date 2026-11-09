@@ -200,6 +200,9 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	}
 	conn.udpAccess.Lock()
 	defer conn.udpAccess.Unlock()
+	if conn.udpClosed {
+		return nil, net.ErrClosed
+	}
 	for attempts := 0; attempts < 1<<16; attempts++ {
 		sessionID := conn.udpSessionID
 		conn.udpSessionID++
@@ -222,10 +225,11 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 }
 
 func (c *Client) CloseWithError(err error) error {
-	// Wait for any in-flight creation and close it before allowing reconnect.
+	// Wait for any in-flight creation, then close outside the publication lock.
+	// Child cleanup must run without holding a parent lock.
 	c.connAccess.Lock()
-	defer c.connAccess.Unlock()
 	conn := c.conn
+	c.connAccess.Unlock()
 	if conn != nil {
 		conn.closeWithError(err)
 	}
@@ -239,6 +243,7 @@ type clientQUICConnection struct {
 	connDone     chan struct{}
 	connErr      error
 	udpAccess    sync.RWMutex
+	udpClosed    bool // guarded by udpAccess
 	udpConnMap   map[uint16]*udpPacketConn
 	udpSessionID uint16
 
@@ -263,8 +268,18 @@ func (c *clientQUICConnection) closeWithError(err error) {
 	c.closeOnce.Do(func() {
 		c.connErr = err
 		close(c.connDone)
+		// Stop admission and detach before closing children: their destroy
+		// callbacks acquire udpAccess too.
+		c.udpAccess.Lock()
+		c.udpClosed = true
+		packets := c.udpConnMap
+		c.udpConnMap = nil
+		c.udpAccess.Unlock()
 		_ = c.quicConn.CloseWithError(0, "")
 		_ = c.rawConn.Close()
+		for _, packet := range packets {
+			_ = packet.Close()
+		}
 	})
 }
 

@@ -36,7 +36,7 @@ BOUNDARIES = "^(TestFragmentBounds|TestWaitReadPacket|TestLowDatagram)"
 
 # Only cache locations and module transport policy survive from Go's ambient
 # environment. Toolchains, targets, flags and runtime diagnostics are owned here.
-GO_RETAIN = {"GOCACHE", "GOMODCACHE", "GOPROXY", "GOSUMDB", "GOPRIVATE",
+GO_RETAIN = {"GOPATH", "GOCACHE", "GOMODCACHE", "GOPROXY", "GOSUMDB", "GOPRIVATE",
              "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GOVCS"}
 ENV_FIXED = {
     "GOENV": "off", "GOTOOLCHAIN": "local", "GOWORK": "off",
