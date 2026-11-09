@@ -37,6 +37,11 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
 func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
 	sessionID := message.sessionID
 	s.udpAccess.Lock()
+	if s.udpClosed {
+		s.udpAccess.Unlock()
+		message.releaseMessage()
+		return
+	}
 	udpConn, loaded := s.udpConnMap[sessionID]
 	created := !loaded || common.Done(udpConn.ctx)
 	if created {

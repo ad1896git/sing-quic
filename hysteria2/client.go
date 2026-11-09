@@ -262,26 +262,29 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	if conn.udpDisabled {
 		return nil, E.New("UDP disabled by server")
 	}
-	var sessionID uint32
+	conn.udpAccess.Lock()
+	defer conn.udpAccess.Unlock()
+	if conn.udpClosed {
+		return nil, net.ErrClosed
+	}
+	sessionID := conn.udpSessionID
+	conn.udpSessionID++
 	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, func() {
 		conn.udpAccess.Lock()
 		delete(conn.udpConnMap, sessionID)
 		conn.udpAccess.Unlock()
 	}, conn.defragBudget)
-	conn.udpAccess.Lock()
-	sessionID = conn.udpSessionID
-	conn.udpSessionID++
-	conn.udpConnMap[sessionID] = clientPacketConn
-	conn.udpAccess.Unlock()
 	clientPacketConn.sessionID = sessionID
+	conn.udpConnMap[sessionID] = clientPacketConn
 	return clientPacketConn, nil
 }
 
 func (c *Client) CloseWithError(err error) error {
-	// Wait for any in-flight creation and close it before allowing reconnect.
+	// Wait for any in-flight creation, then close outside the publication lock.
+	// Child cleanup must run without holding a parent lock.
 	c.connAccess.Lock()
-	defer c.connAccess.Unlock()
 	conn := c.conn
+	c.connAccess.Unlock()
 	if conn != nil {
 		conn.closeWithError(err)
 	}
@@ -297,6 +300,7 @@ type clientQUICConnection struct {
 	connErr      error
 	udpDisabled  bool
 	udpAccess    sync.RWMutex
+	udpClosed    bool // guarded by udpAccess
 	udpConnMap   map[uint32]*udpPacketConn
 	udpSessionID uint32
 
@@ -321,12 +325,22 @@ func (c *clientQUICConnection) closeWithError(err error) {
 	c.closeOnce.Do(func() {
 		c.connErr = err
 		close(c.connDone)
+		// Stop admission and detach before closing children: their destroy
+		// callbacks acquire udpAccess too.
+		c.udpAccess.Lock()
+		c.udpClosed = true
+		packets := c.udpConnMap
+		c.udpConnMap = nil
+		c.udpAccess.Unlock()
 		_ = c.quicConn.CloseWithError(0, "")
 		if c.packetConn != nil {
 			_ = c.packetConn.Close()
 		}
 		if c.rawConn != nil {
 			_ = c.rawConn.Close()
+		}
+		for _, packet := range packets {
+			_ = packet.Close()
 		}
 	})
 }

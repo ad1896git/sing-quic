@@ -301,7 +301,8 @@ class StartupTests(unittest.TestCase):
                        GOOS='plan9', GOARCH='386', GOEXPERIMENT='invalid',
                        CGO_CFLAGS='-broken', CC='/bad/compiler', GORACE='exitcode=0',
                        NKR_TEST_LOWDGRAM='1', NKR_STRESS_STREAMS='1',
-                       GOMODCACHE='/scratch/modules', GOCACHE='/scratch/build')
+                       GOMODCACHE='/scratch/modules', GOCACHE='/scratch/build',
+                       GOPATH='/scratch/gopath')
         env = MATRIX.matrix_environment(hostile)
         for key, value in MATRIX.ENV_FIXED.items():
             self.assertEqual(env[key], value)
@@ -309,6 +310,7 @@ class StartupTests(unittest.TestCase):
             self.assertNotIn(key, env)
         self.assertEqual(env['GOMODCACHE'], '/scratch/modules')
         self.assertEqual(env['GOCACHE'], '/scratch/build')
+        self.assertEqual(env['GOPATH'], '/scratch/gopath')
         self.assertEqual(MATRIX.matrix_environment(env), env)
 
     def test_main_normalizes_before_selftests_and_fails_closed_on_download(self):

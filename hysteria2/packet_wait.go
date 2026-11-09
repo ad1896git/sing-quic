@@ -14,6 +14,9 @@ func (c *udpPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCop
 }
 
 func (c *udpPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
+	if c.ctx.Err() != nil {
+		return nil, M.Socksaddr{}, io.ErrClosedPipe
+	}
 	select {
 	case p := <-c.data:
 		destination = M.ParseSocksaddr(p.destination)

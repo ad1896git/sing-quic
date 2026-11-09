@@ -162,6 +162,9 @@ func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, udpStream b
 }
 
 func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	if c.ctx.Err() != nil {
+		return M.Socksaddr{}, io.ErrClosedPipe
+	}
 	select {
 	case p := <-c.data:
 		_, err = buffer.ReadOnceFrom(p.data)
@@ -174,6 +177,9 @@ func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr,
 }
 
 func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	if c.ctx.Err() != nil {
+		return 0, nil, io.ErrClosedPipe
+	}
 	select {
 	case pkt := <-c.data:
 		n = copy(p, pkt.data.Bytes())

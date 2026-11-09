@@ -208,6 +208,9 @@ func TestClientConnectionConcurrencyRequests(t *testing.T) {
 					} else {
 						conn, err = c.ListenPacket(context.Background())
 					}
+					if errors.Is(err, net.ErrClosed) {
+						continue
+					}
 					if err != nil {
 						t.Error(err)
 						return
