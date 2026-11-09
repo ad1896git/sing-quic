@@ -32,7 +32,8 @@ SEC_MATRIX_GO=/path/to/go1.22.12 python3 -B -m unittest discover \
 The self-tests apply the same attacks to **both PASS and XFAIL** expectations:
 post-test and background panics, silent exits, failed/fatal assertions (including
 subtests and another goroutine), a TestMain suppressing those failures with exit
-0, actual races under `-race`, signals, hangs, test deadlines, build/converter
+0, actual in-test and post-`m.Run` races under `-race`, hostile inherited
+GORACE/GOFLAGS settings, signals, hangs, test deadlines, build/converter
 failures, stale/missing binaries, lost output, wrong diagnostics, vacuous runs,
 missing/extra/duplicate tests and packages, unexpected skips, corrupt lifecycles,
 and malformed/raw output. Real stdlib-only Go probes use the production row
@@ -59,6 +60,45 @@ absent; KI-1's patch addresses a separate read synchronization defect.
 On macOS the runner uses external linking because macOS 27 rejects Go 1.22's
 internally linked test executables without LC_UUID. Linux uses normal linking.
 The GitHub workflow runs both dependency sets on Linux and uploads the evidence.
+
+## Controlled Go environment and cold caches
+
+The runner normalizes its environment before self-tests and dependency setup;
+`run_row` normalizes again before building, executing and converting binaries.
+It sets `GORACE=log_path=stderr exitcode=66 halt_on_error=1 atexit_sleep_ms=0`.
+A detected race is visible in the owned stderr capture and exits 66, which is
+accepted by neither PASS (0) nor XFAIL (1). This includes races after `m.Run`
+when no testing.T is active. Inherited `exitcode=0/1` or `log_path` cannot
+redirect reports or make a detected race an accepted status.
+
+| Variable | Effective handling |
+| --- | --- |
+| `GOENV` | `off`; ignore settings saved with `go env -w` |
+| `GOTOOLCHAIN` | `local`; require the selected Go 1.22.12 executable |
+| `GOWORK` | `off`; ignore ambient workspace selection |
+| `GOFLAGS` | `-mod=readonly`; all row flags are explicit argv entries |
+| `CGO_ENABLED` | `1`, including every race build |
+| `GOTRACEBACK` | `all`; retain panic stacks |
+| `GODEBUG` | Empty; Go's default runtime behavior |
+| `GOMAXPROCS` | `2`; fixed parallel runtime, including race probes |
+| Other `GO*`, including `GOOS`, `GOARCH`, `GOEXPERIMENT`, `GOPATH` | Removed except the cache/module-transport settings below; native/default Go settings apply |
+| `CGO_*`, `CC`, `CXX`, `FC`, `AR`, `PKG_CONFIG` | Removed before setting `CGO_ENABLED`; use native compiler defaults |
+| `NKR_TEST_LOWDGRAM`, `NKR_STRESS_STREAMS` | Removed at startup; only explicit XFAIL rows enable the low-datagram opt-in |
+| `GOCACHE`, `GOMODCACHE` | Retained to support isolated warm or cold scratch caches |
+| `GOPROXY`, `GOSUMDB`, `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB`, `GOINSECURE`, `GOVCS` | Retained module transport/auth policy; downloads must succeed |
+
+The environment contract and each command's effective controlled variables are
+recorded in `results.json` (null means unset). `go-env.log` records resolved
+native target, cache paths and compiler defaults. Module transport settings may
+contain credentials and are not copied into the transcript. PATH, HOME, temporary
+directory and network/auth settings still locate trusted tools and dependencies.
+The runner assumes a trusted Go/native toolchain and ordinary cache contents.
+
+Each dependency set runs bounded `go mod download` before module/package
+inventory parsing, using the same controlled environment and overlay modfile.
+Download output has its own log; any error stops the matrix. A cold module cache
+therefore does not feed download notices into the strict package parser. The
+binary transcript grammar and package inventory checks remain unchanged.
 
 ## KI-LOWDGRAM: explicit known failure
 
@@ -124,7 +164,8 @@ and require review. Unknown JSON fields/actions, duplicate keys, output outside
 a running lifecycle and incomplete/truncated transcripts fail. Tests with an
 unexpected fail action are rejected even if TestMain returns 0 and the package
 reports pass. Failures in subtests, other goroutines, cleanup and the race
-detector cannot be hidden by a successful outer status.
+detector are rejected independently of a successful outer status; the controlled
+race channel above also covers post-test races.
 
 XFAIL additionally requires one exact `PROTOCOL_VIOLATION (local): DATAGRAM frame
 too large` at each named `low_datagram_test.go` assertion, exactly 18 failing

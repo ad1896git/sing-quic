@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("security_matrix", Path(__file__).with_name("security-matrix.py"))
 MATRIX = importlib.util.module_from_spec(SPEC)
@@ -277,8 +278,53 @@ class SharedClassifierTests(unittest.TestCase):
         self.assertEqual(MATRIX.expected_outcomes(known=True),expected(True))
 
 
+class StartupTests(unittest.TestCase):
+    def test_environment_is_closed_to_ambient_go_settings(self):
+        hostile = dict(os.environ, GOFLAGS='-run=^$', GOENV='/bad/goenv',
+                       GOOS='plan9', GOARCH='386', GOEXPERIMENT='invalid',
+                       CGO_CFLAGS='-broken', CC='/bad/compiler', GORACE='exitcode=0',
+                       NKR_TEST_LOWDGRAM='1', NKR_STRESS_STREAMS='1',
+                       GOMODCACHE='/scratch/modules', GOCACHE='/scratch/build')
+        env = MATRIX.matrix_environment(hostile)
+        for key, value in MATRIX.ENV_FIXED.items():
+            self.assertEqual(env[key], value)
+        for key in MATRIX.ENV_SCRUB | {'GOOS', 'GOARCH', 'GOEXPERIMENT', 'CGO_CFLAGS'}:
+            self.assertNotIn(key, env)
+        self.assertEqual(env['GOMODCACHE'], '/scratch/modules')
+        self.assertEqual(env['GOCACHE'], '/scratch/build')
+        self.assertEqual(MATRIX.matrix_environment(env), env)
+
+    def test_main_normalizes_before_selftests_and_fails_closed_on_download(self):
+        with tempfile.TemporaryDirectory(prefix='.startup-probe-', dir=Path(__file__).parent) as temp:
+            out = Path(temp)/'matrix'
+            seen = []
+            def capture(cmd, log, cwd, env, records, timeout=300):
+                seen.append((cmd, dict(env)))
+                body = 'go version go1.22.12 native/native\n' if cmd[1:] == ['version'] else ''
+                log.write_text(body)
+                return {'exit': 7 if cmd[1:3] == ['mod', 'download'] else 0,
+                        'timed_out': False, 'command': cmd, 'log': str(log)}
+            with mock.patch.dict(os.environ, GOFLAGS='-run=^$', GORACE='exitcode=0 log_path=/bad',
+                                 GOTRACEBACK='none', GODEBUG='invalidptr=0', CGO_ENABLED='0'), \
+                 mock.patch.object(sys, 'argv', ['security-matrix.py', '--dependencies', 'standalone',
+                                                '--output', str(out)]), \
+                 mock.patch.object(MATRIX.shutil, 'which', return_value='/trusted/go'), \
+                 mock.patch.object(MATRIX, 'capture_command', side_effect=capture):
+                self.assertEqual(MATRIX.main(), 1)
+            self.assertIn('unittest', seen[0][0])
+            for _, env in seen:
+                for key, value in MATRIX.ENV_FIXED.items():
+                    self.assertEqual(env[key], value)
+            self.assertEqual(seen[-1][0], ['/trusted/go', 'mod', 'download'])
+            result = json.loads((out/'results.json').read_text())
+            self.assertEqual(result['rows'], [])
+            self.assertIn('command exit 7', result['error'])
+
+
+
 PROBE_SOURCE = '''package probe
 import ("fmt"; "os"; "testing"; "time"; "syscall"; "sync")
+var raceSink int
 var mode = os.Getenv("SEC_MATRIX_PROBE")
 var known = os.Getenv("SEC_MATRIX_EXPECTED") == "xfail"
 func init() {
@@ -311,6 +357,11 @@ func TestLowDatagramRoundTrip(t *testing.T) {
 func TestMain(m *testing.M) {
     if mode == "skip-all" { os.Exit(0) }
     code:=m.Run()
+    if mode == "post-race" {
+        var n int; var wg sync.WaitGroup; wg.Add(2)
+        for i:=0;i<2;i++ { go func(){ defer wg.Done(); for j:=0;j<10000;j++ {n++} }() }; wg.Wait()
+        raceSink = n
+    }
     switch mode {
     case "trailing-output": fmt.Fprintln(os.Stderr,"unrelated cleanup error")
     case "exit2": os.Exit(2)
@@ -334,12 +385,12 @@ class RealProcessTests(unittest.TestCase):
         (cls.root/'go.mod').write_text(f'module {MATRIX.MODULE}\n\ngo 1.22\n')
         for protocol in MATRIX.PROTOCOLS:
             (cls.root/protocol).mkdir()
-            (cls.root/protocol/'low_datagram_test.go').write_text(PROBE_SOURCE)
+            (cls.root/protocol/'low_datagram_test.go').write_text('//go:build !sec_matrix_hostile\n\n' + PROBE_SOURCE)
         cls.go = os.environ.get('SEC_MATRIX_GO','go')
         cls.env = dict(os.environ,GOTOOLCHAIN='local',GOWORK='off',GOFLAGS='-mod=readonly',CGO_ENABLED='1')
         cls.number = 0
 
-    def probe(self, known, mode, reject=True, go=None, flags=(), all_packages=False, stale=False, build_failure=False):
+    def probe(self, known, mode, reject=True, go=None, flags=(), all_packages=False, stale=False, build_failure=False, hostile=None):
         type(self).number += 1
         out = self.root/f'{self.number}-{known}-{mode}'
         out.mkdir()
@@ -349,8 +400,8 @@ class RealProcessTests(unittest.TestCase):
             binary.chmod(0o700)
         wanted = expected(known) if all_packages else {PACKAGE: expected(known)[PACKAGE]}
         env = dict(self.env,SEC_MATRIX_EXPECTED='xfail' if known else 'pass',SEC_MATRIX_PROBE=mode)
-        if mode == 'race0':
-            env['GORACE'] = 'exitcode=0'
+        if hostile:
+            env.update(hostile)
         records = []
         def run():
             return MATRIX.run_row(go or self.go,self.root,out,'probe',[],env,records,wanted,
@@ -372,7 +423,7 @@ class RealProcessTests(unittest.TestCase):
             self.assertTrue(runs)
             codes = {'exit2':2, 'panic':2, 'goroutine-panic':2, 'timeout':2, 'signal':-9,
                      'hang':-9, 'skip-all':0, 'no-tests':0, 'skip':0, 'assert':1, 'assert0':0,
-                     'fatal':1, 'goroutine-assert':1, 'init0':0, 'init1':1, 'race0':0, 'exit0':0}
+                     'fatal':1, 'goroutine-assert':1, 'init0':0, 'init1':1, 'race0':66, 'post-race':66, 'exit0':0}
             self.assertTrue(all(r['exit'] == codes.get(mode,int(known)) for r in runs))
             self.assertEqual(any(r['timed_out'] for r in runs),mode == 'hang')
             if mode in ['panic','goroutine-panic','assert0','trailing-output']:
@@ -395,11 +446,40 @@ class RealProcessTests(unittest.TestCase):
             for mode in modes:
                 with self.subTest(known=known,mode=mode): self.probe(known,mode)
 
-    def test_real_data_race_even_with_suppressed_exit(self):
+    def test_real_data_race_uses_owned_exit_policy(self):
         for known in [False,True]:
             with self.subTest(known=known):
                 out,_ = self.probe(known,'race0',flags=['-race'])
                 self.assertIn('WARNING: DATA RACE',(out/'probe-hysteria-binary.log').read_text())
+
+    def test_hostile_environment_cannot_hide_post_test_race_or_assertion(self):
+        # Unlike an in-test race, this race has no testing.T fail action. Both
+        # accepted statuses (0 for PASS, 1 for XFAIL) and file redirection must
+        # be overridden before the process starts.
+        for known in [False, True]:
+            hostile = {
+                'GORACE': f'exitcode={int(known)} log_path={self.root}/hidden-race atexit_sleep_ms=0',
+                'GOFLAGS': '-tags=sec_matrix_hostile -race=false',
+                'GOTRACEBACK': 'none', 'GODEBUG': 'invalidptr=0',
+                'CGO_ENABLED': '0', 'GOMAXPROCS': '1', 'GOTOOLCHAIN': 'auto',
+            }
+            with self.subTest(known=known, mode='post-race'):
+                out, records = self.probe(known, 'post-race', flags=['-race'], hostile=hostile)
+                self.assertIn('WARNING: DATA RACE', (out/'probe-hysteria-binary.log').read_text())
+                for record in records:
+                    for key, value in MATRIX.ENV_FIXED.items():
+                        self.assertEqual(record['environment'][key], value)
+            with self.subTest(known=known, mode='assert0'):
+                # This tag selects an alternate source file that suppresses
+                # the real assertion, if ambient GOFLAGS reaches the compiler.
+                bypass = self.root/'hysteria/hostile_test.go'
+                bypass.write_text('//go:build sec_matrix_hostile\n\n' + PROBE_SOURCE.replace(
+                    'if mode == "assert" || mode == "assert0" { t.Error("real failed assertion") }', ''))
+                try:
+                    self.probe(known, 'assert0', hostile=hostile)
+                finally:
+                    bypass.unlink()
+        self.assertFalse(list(self.root.glob('hidden-race*')))
 
     def test_real_go_normalization_and_dr2_failed_assertion(self):
         for known,mode in [(False,'assert0'),(True,'exit2')]:

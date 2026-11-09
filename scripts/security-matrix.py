@@ -34,6 +34,40 @@ KNOWN_SKIP = ("KNOWN-FAIL/XFAIL KI-LOWDGRAM: peer max datagram limit ignored; "
 BOUNDARIES = "^(TestFragmentBounds|TestWaitReadPacket|TestLowDatagram)"
 
 
+# Only cache locations and module transport policy survive from Go's ambient
+# environment. Toolchains, targets, flags and runtime diagnostics are owned here.
+GO_RETAIN = {"GOCACHE", "GOMODCACHE", "GOPROXY", "GOSUMDB", "GOPRIVATE",
+             "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GOVCS"}
+ENV_FIXED = {
+    "GOENV": "off", "GOTOOLCHAIN": "local", "GOWORK": "off",
+    "GOFLAGS": "-mod=readonly", "CGO_ENABLED": "1",
+    "GORACE": "log_path=stderr exitcode=66 halt_on_error=1 atexit_sleep_ms=0",
+    "GOTRACEBACK": "all", "GODEBUG": "", "GOMAXPROCS": "2",
+}
+ENV_SCRUB = {"CC", "CXX", "FC", "AR", "PKG_CONFIG", "NKR_TEST_LOWDGRAM", "NKR_STRESS_STREAMS"}
+ENV_RECORD = sorted(set(ENV_FIXED) | ENV_SCRUB | {
+    "GOCACHE", "GOMODCACHE", "GOOS", "GOARCH", "GOEXPERIMENT", "GOPATH",
+    "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS",
+})
+
+
+def matrix_environment(inherited):
+    """Ignore saved Go settings and ambient execution/diagnostic overrides.
+
+    PATH, HOME, temporary-directory and network/auth settings still locate the
+    trusted native tools and dependencies; this is not a hostile-tool sandbox.
+    """
+    env = {key: value for key, value in inherited.items()
+           if not ((key.startswith("GO") and key not in GO_RETAIN) or
+                   key.startswith("CGO_") or key in ENV_SCRUB)}
+    env.update(ENV_FIXED)
+    return env
+
+
+def environment_record(env):
+    return {key: env.get(key) for key in ENV_RECORD}
+
+
 def expected_outcomes(known=False, debug=False, boundaries=False):
     """Reviewed inventory, independent of the test execution being classified.
 
@@ -183,8 +217,7 @@ def capture_command(cmd, log, cwd, env, records, timeout=300, stdin=None):
     cmd = [str(x) for x in cmd]
     record = {"command": cmd, "cwd": str(cwd), "timeout_seconds": timeout,
               "log": str(log), "stdin": str(stdin) if stdin else None,
-              "environment": {k: env.get(k) for k in
-                              ["GOTOOLCHAIN", "GOWORK", "GOFLAGS", "CGO_ENABLED", "NKR_TEST_LOWDGRAM", "GORACE"]}}
+              "environment": environment_record(env)}
     records.append(record)
     start = time.monotonic()
     with log.open("wb") as stream:
@@ -244,6 +277,12 @@ def verify_conversion(raw, transcript, tests):
 def run_row(go, root, out, prefix, mod, env, records, expected, flags=(), selection=None,
             timeout=300, binary_timeout=300, test_timeout="180s"):
     """Every row builds fresh binaries, owns their execution, and classifies once."""
+    # Also protect direct users of the production executor (including probes).
+    # The only row-specific opt-in is supplied explicitly by the caller.
+    opt_in = env.get("NKR_TEST_LOWDGRAM") == "1"
+    env = matrix_environment(env)
+    if opt_in:
+        env["NKR_TEST_LOWDGRAM"] = "1"
     exits, raws, transcripts = {}, {}, []
     linker = ["-ldflags=-linkmode=external"] if sys.platform == "darwin" else []
     for package in expected:
@@ -292,12 +331,10 @@ def main():
     go = shutil.which(args.go)
     if not go:
         parser.error("Go executable not found")
-    env = dict(os.environ, GOTOOLCHAIN="local", GOWORK="off", GOFLAGS="-mod=readonly", CGO_ENABLED="1")
-    # Default rows always record the known-failure skips, even in an opt-in shell.
-    env.pop("NKR_TEST_LOWDGRAM", None)
-    env.pop("NKR_STRESS_STREAMS", None)
+    env = matrix_environment(os.environ)
     rows = []
-    metadata = {"platform": platform.platform(), "commands": [], "rows": rows}
+    metadata = {"platform": platform.platform(), "environment": environment_record(env),
+                "commands": [], "rows": rows}
 
     def command(cmd, log, cwd=root, command_env=env, timeout=300):
         record = capture_command(cmd, out / log, cwd, command_env, metadata["commands"], timeout)
@@ -378,10 +415,15 @@ def main():
         version = command([go, "version"], "go-version.log").strip()
         if " go1.22.12 " not in version:
             raise RuntimeError(f"required Go 1.22.12, got {version}")
+        command([go, "env", "-json", *sorted(set(ENV_FIXED) - {"GORACE", "GOTRACEBACK", "GOMAXPROCS"}),
+                 "GOOS", "GOARCH", "GOCACHE", "GOMODCACHE", "GOPATH", "CC", "CXX"], "go-env.log")
         metadata["head"] = command(["git", "rev-parse", "HEAD"], "head.log").strip()
         dependencies = ["standalone", "shipped"] if args.dependencies == "all" else [args.dependencies]
         for dependency in dependencies:
             mod = overlay() if dependency == "shipped" else []
+            # Download diagnostics belong in setup evidence, never in the strict
+            # package/test inventory or binary-output grammars. Fail on error.
+            command([go, "mod", "download", *mod], f"{dependency}-download.log")
             graph = command([go, "list", *mod, "-m", "all"], f"{dependency}-modules.log")
             if any(line.startswith("github.com/sagernet/sing v0.5.") for line in graph.splitlines()):
                 raise RuntimeError("sing v0.5 is outside this matrix")
